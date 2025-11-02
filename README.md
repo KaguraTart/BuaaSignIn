@@ -20,6 +20,10 @@
 
 * [me@wangnan.net](mailto:me@wangnan.net)
 
+**References:**
+
+* [https://github.com/slvf/BUAA-iClassSignIn](https://github.com/slvf/BUAA-iClassSignIn)
+
 ---
 
 ## ⚖️ License
@@ -33,3 +37,4 @@ You are free to use, share, and adapt the code for **non-commercial purposes**, 
 
 
 © 2025 Wang Nan. All rights reserved.
+
