@@ -249,7 +249,7 @@
             const name = studentName.value.trim();
             if (!id || !name) return showMessage('请填写学号与姓名', 'error');
             try {
-                const res = await fetch(`https://buaa.wangnan.net/api/iClassSchedule?studentId=${id}&studentName=${encodeURIComponent(name)}&dateStr=20251031`);
+                const res = await fetch(`https://buaa.wangnan.net/api/iClassSchedule?studentId=${id}&studentName=${encodeURIComponent(name)}`);
                 const data = await res.json();
                 if (data.STATUS !== '0') return showMessage(data.message || '未知错误', 'error');
                 const list = data.result || [];
@@ -308,4 +308,5 @@
         studentName.addEventListener('input', resetAll);
     </script>
 </body>
+
 </html>
