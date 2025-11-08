@@ -116,6 +116,19 @@
             transform: none !important;
         }
 
+        .notice {
+            margin-bottom: 15px;
+            padding: 12px;
+            border-radius: var(--radius);
+            font-size: 13px;
+            text-align: center;
+            opacity: 1;
+            transition: 0.3s;
+            background: rgba(231, 76, 60, 0.15);
+            color: #c0392b;
+            border: 1px solid rgba(231, 76, 60, 0.2);
+        }
+
         .form-group {
             margin-bottom: 15px;
         }
@@ -153,6 +166,13 @@
             background: rgba(231, 76, 60, 0.15);
             color: #c0392b;
             border: 1px solid rgba(231, 76, 60, 0.2);
+        }
+
+        .message.initialize {
+            background: transparent;
+            color: transparent;
+            border: 1px solid transparent;
+            opacity: 0;
         }
 
         footer {
@@ -237,6 +257,8 @@
             msg.className = `message ${type} show`;
             setTimeout(() => msg.classList.remove('show'), 5000);
         }
+
+        showMessage('初始化成功', 'initialize');
         
         function resetAll() {
             schedule.innerHTML = '<option value="" disabled selected class="placeholder">请先查询课程</option>';
@@ -245,10 +267,29 @@
             userId = '';
         }
 
+        function setAllDisabled() {
+            studentId.disabled = true;
+            studentName.disabled = true;
+            schedule.disabled = true;
+            
+            getBtn.disabled = true;
+            signBtn.disabled = true;
+            getBtn.textContent = '课程查询禁用';
+            signBtn.textContent = '签到禁用';
+        
+            const detailsElement = document.querySelector('details.collapse');
+            detailsElement.style.pointerEvents = 'none';
+            detailsElement.style.opacity = '0.7';
+            
+            document.querySelector('p.desc').outerHTML = '<p class="notice">系统维护升级，功能暂停使用</p>';
+        }
+
         getBtn.addEventListener('click', async () => {
             const id = studentId.value.trim();
             const name = studentName.value.trim();
             if (!id || !name) return showMessage('请填写学号与姓名', 'error');
+            getBtn.disabled = true;
+            getBtn.textContent = '查询中...';
             try {
                 const res = await fetch(`https://buaa.wangnan.net/api/iClassSchedule?studentId=${id}&studentName=${encodeURIComponent(name)}`);
                 const data = await res.json();
@@ -270,12 +311,17 @@
                 showMessage('课程查询成功', 'success');
             } catch (e) {
                 showMessage('网络请求失败', 'error');
+            } finally {
+                getBtn.disabled = false;
+                getBtn.textContent = '查询课程';
             }
         });
 
         signBtn.addEventListener('click', async () => {
             const val = schedule.value;
             if (!val) return;
+            signBtn.disabled = true;
+            signBtn.textContent = '签到中...';
             const item = JSON.parse(val);
             item.user_id = userId;
             item.studentId = studentId.value.trim();
@@ -297,6 +343,9 @@
                 }
             } catch (e) {
                 showMessage('网络错误', 'error');
+            } finally {
+                signBtn.disabled = !schedule.value;
+                signBtn.textContent = '签到';
             }
         });
 
@@ -307,8 +356,11 @@
         
         studentId.addEventListener('input', resetAll);
         studentName.addEventListener('input', resetAll);
+
+        //setAllDisabled();
     </script>
 </body>
 
 </html>
+
 
