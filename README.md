@@ -36,5 +36,6 @@ You are free to use, share, and adapt the code for **non-commercial purposes**, 
 * You **distribute any modifications under the same license**.
 
 
-© 2025 Wang Nan. All rights reserved.
+© 2025-2026 Wang Nan. All rights reserved.
+
 
