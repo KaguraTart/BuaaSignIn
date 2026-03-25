@@ -3,9 +3,9 @@
  * 同时提供前端页面 + API 代理
  */
 
-const ICRAFT_LOGIN = 'https://db3aa7b5d933a649-111-202-175-205.serveousercontent.com/app/user/login.action';
-const ICRAFT_SCHEDULE = 'https://db3aa7b5d933a649-111-202-175-205.serveousercontent.com/app/course/get_stu_course_sched.action';
-const ICRAFT_SIGN = 'https://db3aa7b5d933a649-111-202-175-205.serveousercontent.com/iclass/app/course/stu_scan_sign.action';
+const ICRAFT_LOGIN = 'https://iclass.buaa.edu.cn:8347/app/user/login.action';
+const ICRAFT_SCHEDULE = 'https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action';
+const ICRAFT_SIGN = 'http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -29,40 +29,6 @@ async function handleApi(request) {
   if (path === '/api/status') {
     return json({ ok: true, ts: Date.now() });
   }
-  // 调试：测试 iClass 连通性
-  if (path === '/api/debug') {
-    const phone = url.searchParams.get('phone') || '';
-    try {
-      const u = new URL(ICRAFT_LOGIN);
-      u.searchParams.set('phone', phone);
-      u.searchParams.set('password', '');
-      u.searchParams.set('userLevel', '1');
-      u.searchParams.set('verificationType', '2');
-      u.searchParams.set('verificationUrl', '');
-      const res = await fetch(u.toString(), {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-          'Accept': 'application/json',
-        },
-      });
-      const text = await res.text();
-      return json({
-        status: res.status,
-        body: text.substring(0, 300),
-      });
-    } catch (e) {
-      return json({ error: e.message, name: e.name });
-    }
-  }
-  // 调试2：测试基本网络连通性
-  if (path === '/api/debug2') {
-    try {
-      const r = await fetch('https://www.cloudflare.com/');
-      return json({ cf_ok: true, status: r.status });
-    } catch (e) {
-      return json({ cf_ok: false, error: e.message });
-    }
-  }
   // 登录
   if (path === '/api/login' && request.method === 'GET') {
     const phone = url.searchParams.get('phone');
@@ -74,17 +40,10 @@ async function handleApi(request) {
       u.searchParams.set('userLevel', '1');
       u.searchParams.set('verificationType', '2');
       u.searchParams.set('verificationUrl', '');
-      const res = await fetch(u.toString(), {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/json, text/plain, */*',
-          'Referer': 'https://iclass.buaa.edu.cn/',
-        },
-        redirect: 'follow',
-      });
+      const res = await fetch(u.toString());
       const text = await res.text();
       let data;
-      try { data = JSON.parse(text); } catch { return json({ status: '1', message: 'iClass 响应解析失败', raw: text.substring(0, 200) }, 502); }
+      try { data = JSON.parse(text); } catch { return json({ status: '1', message: 'iClass 响应解析失败' }, 502); }
       if (data.STATUS === '0' || data.status === '0') {
         return json({ status: '0', result: { id: data.result?.id, sessionId: data.result?.sessionId } });
       }
@@ -104,7 +63,6 @@ async function handleApi(request) {
       u.searchParams.set('id', userId);
       const res = await fetch(u.toString(), {
         headers: { 'User-Agent': 'Mozilla/5.0', 'sessionId': sessionId },
-        redirect: 'follow',
       });
       const text = await res.text();
       let data;
@@ -126,7 +84,6 @@ async function handleApi(request) {
         method: 'POST',
         headers: { 'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded' },
         body: `id=${encodeURIComponent(uid)}`,
-        redirect: 'follow',
       });
       const text = await res.text();
       let data;
