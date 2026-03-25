@@ -3,9 +3,9 @@
  * 同时提供前端页面 + API 代理
  */
 
-const ICRAFT_LOGIN = 'https://iclass.buaa.edu.cn:8347/app/user/login.action';
-const ICRAFT_SCHEDULE = 'https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action';
-const ICRAFT_SIGN = 'http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action';
+const ICRAFT_LOGIN = 'https://db3aa7b5d933a649-111-202-175-205.serveousercontent.com/app/user/login.action';
+const ICRAFT_SCHEDULE = 'https://db3aa7b5d933a649-111-202-175-205.serveousercontent.com/app/course/get_stu_course_sched.action';
+const ICRAFT_SIGN = 'https://db3aa7b5d933a649-111-202-175-205.serveousercontent.com/iclass/app/course/stu_scan_sign.action';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -80,6 +80,7 @@ async function handleApi(request) {
           'Accept': 'application/json, text/plain, */*',
           'Referer': 'https://iclass.buaa.edu.cn/',
         },
+        redirect: 'follow',
       });
       const text = await res.text();
       let data;
@@ -103,6 +104,7 @@ async function handleApi(request) {
       u.searchParams.set('id', userId);
       const res = await fetch(u.toString(), {
         headers: { 'User-Agent': 'Mozilla/5.0', 'sessionId': sessionId },
+        redirect: 'follow',
       });
       const text = await res.text();
       let data;
@@ -124,6 +126,7 @@ async function handleApi(request) {
         method: 'POST',
         headers: { 'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded' },
         body: `id=${encodeURIComponent(uid)}`,
+        redirect: 'follow',
       });
       const text = await res.text();
       let data;
