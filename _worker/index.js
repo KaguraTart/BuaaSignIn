@@ -84,7 +84,9 @@ async function handleApi(request) {
       });
       const text = await res.text();
       let data;
-      try { data = JSON.parse(text); } catch { return json({ status: '1', message: 'iClass 响应解析失败', raw: text.substring(0, 200) }, 502); }
+      try { data = JSON.parse(text); } catch {
+        return json({ status: '1', message: 'iClass 响应解析失败', raw: text.substring(0, 200), httpStatus: res.status, url: u.toString().substring(0, 100) }, 502);
+      }
       if (data.STATUS === '0' || data.status === '0') {
         return json({ status: '0', result: { id: data.result?.id, sessionId: data.result?.sessionId } });
       }
