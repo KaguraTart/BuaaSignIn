@@ -29,7 +29,6 @@ async function handleApi(request) {
   if (path === '/api/status') {
     return json({ ok: true, ts: Date.now() });
   }
-
   // 登录
   if (path === '/api/login' && request.method === 'GET') {
     const phone = url.searchParams.get('phone');
