@@ -21,6 +21,7 @@ function httpRequest(targetUrl, opts) {
 
     const hostname = parsed.hostname;
     const isHttps = (parsed.protocol || '').startsWith('https');
+    console.log('  parsed.protocol:', parsed.protocol, 'isHttps:', isHttps);
     const port = parsed.port || (isHttps ? 443 : 80);
 
     console.log('→ 请求:', targetUrl, 'port:', port);
@@ -31,6 +32,7 @@ function httpRequest(targetUrl, opts) {
     delete headers['content-length'];
 
     const httpMod = isHttps ? https : http;
+    console.log('协议模块:', httpMod === https ? 'https' : 'http');
     const reqOptions = {
       hostname,
       port,
@@ -76,6 +78,7 @@ const server = http.createServer((req, res) => {
       }
 
       let targetUrl = `${targetProto}://${targetHost}:${targetPort}${targetPath}${reqUrl.search}`;
+      console.log('目标URL:', targetUrl);
 
       const headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
