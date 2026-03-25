@@ -14,10 +14,6 @@ const BYPASS_PROXY = new Set([
   'iclass.buaa.edu.cn',
 ]);
 
-function shouldBypassProxy(host) {
-  return BYPASS_PROXY.has(host);
-}
-
 function doRequest(targetUrl, opts) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
@@ -25,14 +21,19 @@ function doRequest(targetUrl, opts) {
     const isHttps = parsed.protocol === 'https:';
     const port = parsed.port || (isHttps ? 443 : 80);
 
+    console.log('→ 请求:', targetUrl, '端口:', port);
+
     const headers = { ...opts.headers };
     delete headers['host'];
     delete headers['connection'];
     delete headers['content-length'];
 
-    // 始终直连，不走任何代理
     const proto = isHttps ? https : http;
-    const req = proto.request({ hostname, port, path: parsed.pathname + parsed.search, method: opts.method, headers }, resolve);
+    const req = proto.request({ hostname, port, path: parsed.pathname + parsed.search, method: opts.method, headers }, (res) => {
+      console.log('← 响应状态:', res.statusCode);
+      resolve(res);
+    });
+    req.on('error', (e) => console.log('✗ 错误:', e.message));
     req.on('error', reject);
     if (opts.body) req.write(opts.body);
     req.end();
@@ -49,6 +50,7 @@ function collectBody(res) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
+  console.log('收到请求:', req.method, req.url);
 
   let targetProto, targetHost, targetPort, targetPath;
   if (url.pathname.startsWith('/iclass/')) {
@@ -60,6 +62,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   const targetUrl = `${targetProto}://${targetHost}:${targetPort}${targetPath}${url.search}`;
+  console.log('目标:', targetUrl);
 
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -78,19 +81,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    // 直接请求，不走代理
     let proxyRes = await doRequest(targetUrl, { method: req.method, headers, body });
 
-    // 跟随重定向
     for (let i = 0; i < 5; i++) {
       if (![301, 302, 303, 307, 308].includes(proxyRes.statusCode)) break;
       const location = proxyRes.headers.location;
       if (!location) break;
-
-      // 解析重定向目标
-      let redirectUrl;
-      try { redirectUrl = new URL(location, targetUrl).toString(); } catch { break; }
-
+      const redirectUrl = new URL(location, targetUrl).toString();
+      console.log('重定向到:', redirectUrl);
       proxyRes = await doRequest(redirectUrl, { method: req.method, headers, body });
     }
 
@@ -110,6 +108,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(proxyRes.statusCode, outHeaders);
     res.end(bodyBuf);
   } catch (e) {
+    console.log('请求失败:', e.message);
     res.writeHead(502);
     res.end(JSON.stringify({ error: e.message }));
   }
@@ -117,7 +116,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`✅  BUAA iClass 代理已启动: http://localhost:${PORT}`);
-  console.log(`   /iclass/* → http://iclass.buaa.edu.cn:8081 (签到)`);
-  console.log(`   其他路径  → https://iclass.buaa.edu.cn:8347 (登录/课表)`);
-  console.log(`   直连模式，不走代理`);
+  console.log(`   直连 iClass，不走代理`);
 });
