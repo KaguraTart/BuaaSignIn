@@ -9,7 +9,7 @@ import { URL } from 'url';
 
 const PORT = 8787;
 
-function doRequest(targetUrl, opts) {
+function httpRequest(targetUrl, opts) {
   return new Promise((resolve, reject) => {
     let parsed;
     try {
@@ -23,7 +23,7 @@ function doRequest(targetUrl, opts) {
     const isHttps = (parsed.protocol || '').startsWith('https');
     const port = parsed.port || (isHttps ? 443 : 80);
 
-    console.log('→ 请求:', targetUrl, '端口:', port);
+    console.log('→ 请求:', targetUrl, 'port:', port);
 
     const headers = { ...opts.headers };
     delete headers['host'];
@@ -31,12 +31,20 @@ function doRequest(targetUrl, opts) {
     delete headers['content-length'];
 
     const httpMod = isHttps ? https : http;
-    const req = httpMod.request({ hostname, port, path: parsed.pathname + parsed.search, method: opts.method, headers }, (res) => {
-      console.log('← 响应状态:', res.statusCode);
+    const req = httpMod.request({
+      hostname,
+      port,
+      path: parsed.pathname + parsed.search,
+      method: opts.method,
+      headers,
+    }, (res) => {
+      console.log('← 状态:', res.statusCode);
       resolve(res);
     });
-    req.on('error', (e) => console.log('✗ 错误:', e.message));
-    req.on('error', reject);
+    req.on('error', (e) => {
+      console.log('✗ 错误:', e.message);
+      reject(e);
+    });
     if (opts.body) req.write(opts.body);
     req.end();
   });
@@ -51,23 +59,21 @@ function collectBody(res) {
 }
 
 const server = http.createServer((req, res) => {
-  // 用 IIFE 包装 async handler 以正确捕获错误
   (async () => {
     try {
-      const url = new URL(req.url, `http://localhost:${PORT}`);
-      console.log('收到请求:', req.method, req.url);
+      const reqUrl = new URL(req.url, `http://localhost:${PORT}`);
+      console.log('收到:', req.method, reqUrl.pathname + reqUrl.search);
 
       let targetProto, targetHost, targetPort, targetPath;
-      if (url.pathname.startsWith('/iclass/')) {
-        targetProto = http;  targetHost = 'iclass.buaa.edu.cn';
-        targetPort = 8081;   targetPath = '/app' + url.pathname.replace('/iclass', '');
+      if (reqUrl.pathname.startsWith('/iclass/')) {
+        targetProto = 'http';  targetHost = 'iclass.buaa.edu.cn';
+        targetPort = 8081;     targetPath = '/app' + reqUrl.pathname.replace('/iclass', '');
       } else {
-        targetProto = https; targetHost = 'iclass.buaa.edu.cn';
-        targetPort = 8347;   targetPath = '/app' + url.pathname;
+        targetProto = 'https'; targetHost = 'iclass.buaa.edu.cn';
+        targetPort = 8347;     targetPath = '/app' + reqUrl.pathname;
       }
 
-      const targetUrl = `${targetProto}://${targetHost}:${targetPort}${targetPath}${url.search}`;
-      console.log('目标:', targetUrl);
+      let targetUrl = `${targetProto}://${targetHost}:${targetPort}${targetPath}${reqUrl.search}`;
 
       const headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -85,28 +91,28 @@ const server = http.createServer((req, res) => {
         headers['Content-Length'] = Buffer.byteLength(body);
       }
 
-      let proxyRes = await doRequest(targetUrl, { method: req.method, headers, body });
+      let response = await httpRequest(targetUrl, { method: req.method, headers, body });
 
+      // 跟随重定向
       for (let i = 0; i < 5; i++) {
-        if (![301, 302, 303, 307, 308].includes(proxyRes.statusCode)) break;
-        const location = proxyRes.headers.location;
+        if (![301, 302, 303, 307, 308].includes(response.statusCode)) break;
+        const location = response.headers.location;
         if (!location) break;
 
-        let redirectUrl;
         try {
-          redirectUrl = new URL(location, targetUrl).toString();
+          targetUrl = new URL(location, targetUrl).toString();
         } catch (e) {
-          console.log('重定向 URL 解析失败:', location, e.message);
+          console.log('重定向 URL 解析失败:', location);
           break;
         }
-        console.log('重定向到:', redirectUrl);
-        proxyRes = await doRequest(redirectUrl, { method: req.method, headers, body });
+        console.log('重定向到:', targetUrl);
+        response = await httpRequest(targetUrl, { method: req.method, headers, body });
       }
 
-      const bodyBuf = await collectBody(proxyRes);
+      const bodyBuf = await collectBody(response);
 
       const outHeaders = {
-        ...proxyRes.headers,
+        ...response.headers,
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, sessionId',
@@ -116,11 +122,11 @@ const server = http.createServer((req, res) => {
       delete outHeaders['content-length'];
       outHeaders['Content-Length'] = bodyBuf.length;
 
-      res.writeHead(proxyRes.statusCode, outHeaders);
+      res.writeHead(response.statusCode, outHeaders);
       res.end(bodyBuf);
 
     } catch (e) {
-      console.log('请求失败:', e.message, e.stack);
+      console.log('请求失败:', e.message);
       res.writeHead(502);
       res.end(JSON.stringify({ error: e.message }));
     }
