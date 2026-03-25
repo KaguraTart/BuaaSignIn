@@ -9,14 +9,16 @@ import { URL } from 'url';
 
 const PORT = 8787;
 
-// iClass 内网域名，强制直连（不走任何代理）
-const BYPASS_PROXY = new Set([
-  'iclass.buaa.edu.cn',
-]);
-
 function doRequest(targetUrl, opts) {
   return new Promise((resolve, reject) => {
-    const parsed = new URL(targetUrl);
+    let parsed;
+    try {
+      parsed = new URL(targetUrl);
+    } catch (e) {
+      reject(new Error('Invalid URL: ' + targetUrl + ' - ' + e.message));
+      return;
+    }
+
     const hostname = parsed.hostname;
     const isHttps = parsed.protocol === 'https:';
     const port = parsed.port || (isHttps ? 443 : 80);
@@ -48,70 +50,81 @@ function collectBody(res) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  console.log('收到请求:', req.method, req.url);
+const server = http.createServer((req, res) => {
+  // 用 IIFE 包装 async handler 以正确捕获错误
+  (async () => {
+    try {
+      const url = new URL(req.url, `http://localhost:${PORT}`);
+      console.log('收到请求:', req.method, req.url);
 
-  let targetProto, targetHost, targetPort, targetPath;
-  if (url.pathname.startsWith('/iclass/')) {
-    targetProto = http;  targetHost = 'iclass.buaa.edu.cn';
-    targetPort = 8081;   targetPath = '/app' + url.pathname.replace('/iclass', '');
-  } else {
-    targetProto = https; targetHost = 'iclass.buaa.edu.cn';
-    targetPort = 8347;   targetPath = '/app' + url.pathname;
-  }
+      let targetProto, targetHost, targetPort, targetPath;
+      if (url.pathname.startsWith('/iclass/')) {
+        targetProto = http;  targetHost = 'iclass.buaa.edu.cn';
+        targetPort = 8081;   targetPath = '/app' + url.pathname.replace('/iclass', '');
+      } else {
+        targetProto = https; targetHost = 'iclass.buaa.edu.cn';
+        targetPort = 8347;   targetPath = '/app' + url.pathname;
+      }
 
-  const targetUrl = `${targetProto}://${targetHost}:${targetPort}${targetPath}${url.search}`;
-  console.log('目标:', targetUrl);
+      const targetUrl = `${targetProto}://${targetHost}:${targetPort}${targetPath}${url.search}`;
+      console.log('目标:', targetUrl);
 
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Referer': 'https://iclass.buaa.edu.cn/',
-    'Accept-Encoding': 'identity',
-  };
-  if (req.headers['sessionid']) headers['sessionId'] = req.headers['sessionid'];
+      const headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://iclass.buaa.edu.cn/',
+        'Accept-Encoding': 'identity',
+      };
+      if (req.headers['sessionid']) headers['sessionId'] = req.headers['sessionid'];
 
-  let body = '';
-  if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
-    const chunks = [];
-    for await (const c of req) chunks.push(c);
-    body = Buffer.concat(chunks).toString();
-    headers['Content-Length'] = Buffer.byteLength(body);
-  }
+      let body = '';
+      if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        body = Buffer.concat(chunks).toString();
+        headers['Content-Length'] = Buffer.byteLength(body);
+      }
 
-  try {
-    let proxyRes = await doRequest(targetUrl, { method: req.method, headers, body });
+      let proxyRes = await doRequest(targetUrl, { method: req.method, headers, body });
 
-    for (let i = 0; i < 5; i++) {
-      if (![301, 302, 303, 307, 308].includes(proxyRes.statusCode)) break;
-      const location = proxyRes.headers.location;
-      if (!location) break;
-      const redirectUrl = new URL(location, targetUrl).toString();
-      console.log('重定向到:', redirectUrl);
-      proxyRes = await doRequest(redirectUrl, { method: req.method, headers, body });
+      for (let i = 0; i < 5; i++) {
+        if (![301, 302, 303, 307, 308].includes(proxyRes.statusCode)) break;
+        const location = proxyRes.headers.location;
+        if (!location) break;
+
+        let redirectUrl;
+        try {
+          redirectUrl = new URL(location, targetUrl).toString();
+        } catch (e) {
+          console.log('重定向 URL 解析失败:', location, e.message);
+          break;
+        }
+        console.log('重定向到:', redirectUrl);
+        proxyRes = await doRequest(redirectUrl, { method: req.method, headers, body });
+      }
+
+      const bodyBuf = await collectBody(proxyRes);
+
+      const outHeaders = {
+        ...proxyRes.headers,
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, sessionId',
+      };
+      delete outHeaders['transfer-encoding'];
+      delete outHeaders['content-encoding'];
+      delete outHeaders['content-length'];
+      outHeaders['Content-Length'] = bodyBuf.length;
+
+      res.writeHead(proxyRes.statusCode, outHeaders);
+      res.end(bodyBuf);
+
+    } catch (e) {
+      console.log('请求失败:', e.message, e.stack);
+      res.writeHead(502);
+      res.end(JSON.stringify({ error: e.message }));
     }
-
-    const bodyBuf = await collectBody(proxyRes);
-
-    const outHeaders = {
-      ...proxyRes.headers,
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, sessionId',
-    };
-    delete outHeaders['transfer-encoding'];
-    delete outHeaders['content-encoding'];
-    delete outHeaders['content-length'];
-    outHeaders['Content-Length'] = bodyBuf.length;
-
-    res.writeHead(proxyRes.statusCode, outHeaders);
-    res.end(bodyBuf);
-  } catch (e) {
-    console.log('请求失败:', e.message);
-    res.writeHead(502);
-    res.end(JSON.stringify({ error: e.message }));
-  }
+  })();
 });
 
 server.listen(PORT, () => {
