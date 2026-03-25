@@ -3,9 +3,9 @@
  * 同时提供前端页面 + API 代理
  */
 
-const ICRAFT_LOGIN = 'https://db3aa7b5d933a649-111-202-175-205.serveousercontent.com/app/user/login.action';
-const ICRAFT_SCHEDULE = 'https://db3aa7b5d933a649-111-202-175-205.serveousercontent.com/app/course/get_stu_course_sched.action';
-const ICRAFT_SIGN = 'https://db3aa7b5d933a649-111-202-175-205.serveousercontent.com/iclass/app/course/stu_scan_sign.action';
+const ICRAFT_LOGIN = 'https://abstracts-homepage-facial-teens.trycloudflare.com/app/user/login.action';
+const ICRAFT_SCHEDULE = 'https://abstracts-homepage-facial-teens.trycloudflare.com/app/course/get_stu_course_sched.action';
+const ICRAFT_SIGN = 'https://abstracts-homepage-facial-teens.trycloudflare.com/iclass/app/course/stu_scan_sign.action';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
