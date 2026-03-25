@@ -260,7 +260,7 @@ async function sign(){
   if(!sel)return;
   const item=sel;load(signBtn,sspin,stxt,true);
   try{
-    const r=await fetch('/api/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({courseSchedId:item.id,userId:item.uid})});
+    const r=await fetch('/api/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({courseSchedId:item.id,userId:item.uid,classBeginTime:item.classBeginTime,classEndTime:item.classEndTime})});
     const d=await r.json();
     if(d.status==='0'){
       const s=document.querySelector('.course-item.selected');
@@ -345,8 +345,19 @@ const server = http.createServer(async (req, res) => {
     for await (const c of req) body += c;
     let parsed;
     try { parsed = JSON.parse(body); } catch { return sendJson(res, { status: '1', message: '请求体解析失败' }, 400); }
-    const { courseSchedId, userId } = parsed;
+    const { courseSchedId, userId, classBeginTime, classEndTime } = parsed;
     if (!courseSchedId || !userId) return sendJson(res, { status: '1', message: '缺少必要参数' }, 400);
+
+    // 检查签到窗口：课程开始前10分钟 至 课程结束
+    if (classBeginTime && classEndTime) {
+      const now = Date.now();
+      const begin = new Date(classBeginTime).getTime();
+      const end = new Date(classEndTime).getTime();
+      const tenMinBefore = begin - 10 * 60 * 1000;
+      if (now < tenMinBefore) return sendJson(res, { status: '1', message: '签到尚未开始，请在课程开始前10分钟内签到' });
+      if (now > end) return sendJson(res, { status: '1', message: '课程已结束，无法签到' });
+    }
+
     try {
       const signPath = `/app/course/stu_scan_sign.action?courseSchedId=${encodeURIComponent(courseSchedId)}&timestamp=${Date.now()}`;
       const response = await iClassFetch(signPath, {
