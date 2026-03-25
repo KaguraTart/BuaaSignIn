@@ -74,7 +74,9 @@ const server = http.createServer((req, res) => {
         targetPort = 8081;     targetPath = '/app' + reqUrl.pathname.replace('/iclass', '');
       } else {
         targetProto = 'https'; targetHost = 'iclass.buaa.edu.cn';
-        targetPort = 8347;     targetPath = '/app' + reqUrl.pathname;
+        targetPort = 8347;
+        // 请求路径已经是 /app/...，不需要再拼接 /app/
+        targetPath = reqUrl.pathname;
       }
 
       let targetUrl = `${targetProto}://${targetHost}:${targetPort}${targetPath}${reqUrl.search}`;
@@ -105,7 +107,12 @@ const server = http.createServer((req, res) => {
         if (!location) break;
 
         try {
-          targetUrl = new URL(location, targetUrl).toString();
+          let rawUrl = new URL(location, targetUrl).toString();
+          // 强制 HTTPS，因为 iClass 8347 端口只支持 HTTPS
+          if (rawUrl.startsWith('http://iclass.buaa.edu.cn') || rawUrl.startsWith('http://10.')) {
+            rawUrl = rawUrl.replace('http://', 'https://');
+          }
+          targetUrl = rawUrl;
         } catch (e) {
           console.log('重定向 URL 解析失败:', location);
           break;
