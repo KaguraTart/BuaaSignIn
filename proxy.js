@@ -31,13 +31,15 @@ function httpRequest(targetUrl, opts) {
     delete headers['content-length'];
 
     const httpMod = isHttps ? https : http;
-    const req = httpMod.request({
+    const reqOptions = {
       hostname,
       port,
       path: parsed.pathname + parsed.search,
       method: opts.method,
       headers,
-    }, (res) => {
+    };
+    if (isHttps) reqOptions.rejectUnauthorized = false;
+    const req = httpMod.request(reqOptions, (res) => {
       console.log('← 状态:', res.statusCode);
       resolve(res);
     });
