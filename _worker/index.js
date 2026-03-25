@@ -80,7 +80,6 @@ async function handleApi(request) {
           'Accept': 'application/json, text/plain, */*',
           'Referer': 'https://iclass.buaa.edu.cn/',
         },
-        redirect: 'follow',
       });
       const text = await res.text();
       let data;
@@ -106,7 +105,6 @@ async function handleApi(request) {
       u.searchParams.set('id', userId);
       const res = await fetch(u.toString(), {
         headers: { 'User-Agent': 'Mozilla/5.0', 'sessionId': sessionId },
-        redirect: 'follow',
       });
       const text = await res.text();
       let data;
@@ -128,7 +126,6 @@ async function handleApi(request) {
         method: 'POST',
         headers: { 'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded' },
         body: `id=${encodeURIComponent(uid)}`,
-        redirect: 'follow',
       });
       const text = await res.text();
       let data;
