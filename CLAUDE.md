@@ -6,47 +6,63 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BUAA course sign-in tool with two modes:
 
-1. **Cloudflare Pages deployment** — static frontend + API proxy functions. Deploy by connecting GitHub repo in Cloudflare Dashboard.
-2. **`BUAA-iClassSignIn-main/`** — standalone Python CLI/GUI tool.
+1. **Cloudflare Tunnel + Node.js** — Local proxy + cloudflared tunnel for public access
+2. **`BUAA-iClassSignIn-main/`** — Standalone Python CLI/GUI tool
 
 ## Architecture
 
 ```
-public/             → Frontend static files (served by Cloudflare Pages)
-functions/api/     → Cloudflare Pages Functions (API proxy, adds CORS headers)
-BUAA-iClassSignIn-main/ → Standalone Python sign-in tool
+Browser
+  ↓ (public URL)
+cloudflared quick tunnel (trycloudflare.com, changes on restart)
+  ↓
+proxy.js (localhost:8787) → BUAA iClass (内网)
 ```
 
 ## Key Files
 
-- **`public/index.html`** — Frontend SPA. Calls `/api/*` (same-origin).
-- **`functions/api/index.js`** — Proxy for BUAA iClass APIs.
-  - `GET /api/status` — Health check
-  - `GET /api/login?phone={id}` — Login, returns `{userId, sessionId}`
-  - `GET /api/schedule?dateStr=&userId=&sessionId=` — Query schedule
-  - `POST /api/sign` body `{courseSchedId, userId}` — Sign in
-- **`BUAA-iClassSignIn-main/main.py`** — Python CLI sign-in (phone-based login).
-- **`BUAA-iClassSignIn-main/password_ver.py`** — Python CLI (SSO-based login).
-- **`BUAA-iClassSignIn-main/remotesign/`** — Tkinter GUI version.
+- **`proxy.js`** — Standalone Node.js server. Runs on port 8787. Serves frontend + proxies all API requests to BUAA iClass.
+  - Connects directly to `iclass.buaa.edu.cn` (no proxy)
+  - Auto-follows HTTP redirects, forces HTTPS
+  - Requires `node >= 18`
 
-## Deployment (Cloudflare Pages)
+- **`worker.js`** — Cloudflare Workers entry point (legacy, not currently used)
 
-1. Go to https://dash.cloudflare.com/?to=/pages
-2. Create project → Import Git repository → select `KaguraTart/BuaaSignIn`
-3. Build settings: Build command = empty, Output directory = `public`
-4. Save and Deploy
+- **`public/index.html`** — Frontend static files (for Cloudflare Pages deployment)
 
-Every push to `main` auto-deploys.
+- **`functions/api/index.js`** — Cloudflare Pages Functions version (alternative)
+
+- **`BUAA-iClassSignIn-main/`** — Standalone Python sign-in tool
+
+## Running the Tool
+
+```bash
+# Terminal 1: Start proxy server
+node proxy.js
+
+# Terminal 2: Create public tunnel
+cloudflared tunnel --url http://localhost:8787
+
+# Access via the generated trycloudflare.com URL
+```
+
+For a permanent URL, create a named Cloudflare Tunnel via the Cloudflare Dashboard.
 
 ## iClass API Endpoints
 
-- Login: `GET https://iclass.buaa.edu.cn:8347/app/user/login.action?phone={id}&...`
-- Schedule: `GET https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action?dateStr=&id=` (header: `sessionId`)
-- Sign-in: `POST http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action?courseSchedId=&timestamp=` (body: `id={userId}`)
+- Login: `https://iclass.buaa.edu.cn:8347/app/user/login.action`
+- Schedule: `https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action`
+- Sign-in: `https://iclass.buaa.edu.cn:8347/app/course/stu_scan_sign.action`
 
-## Running Python Version
+## Important Notes
+
+- `iclass.buaa.edu.cn` resolves to `10.20.11.166` (internal BUAA IP). The proxy must connect directly, not through external proxies.
+- The iClass API returns HTTP redirects that must be followed with HTTPS forced (port 8347 only accepts HTTPS).
+- The iClass certificate is self-signed, so `rejectUnauthorized: false` is needed in Node.js HTTPS requests.
+- Sign-in is only allowed between 10 minutes before class start and class end time.
+
+## Python Version
 
 - CLI: edit `student_id` in `main.py`, run `python main.py`.
 - SSO CLI: edit `stu_id`/`stu_pwd` in `password_ver.py`, run `python password_ver.py`.
 - GUI: `pip install requests aiohttp` then `python BUAA-iClassSignIn-main/remotesign/main.py`.
-- Build GUI to exe: `pyinstaller BUAA-iClassSignIn-main/remotesign/main.spec`.
