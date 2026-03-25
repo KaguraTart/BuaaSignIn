@@ -20,7 +20,7 @@ function doRequest(targetUrl, opts) {
     }
 
     const hostname = parsed.hostname;
-    const isHttps = parsed.protocol === 'https:';
+    const isHttps = (parsed.protocol || '').startsWith('https');
     const port = parsed.port || (isHttps ? 443 : 80);
 
     console.log('→ 请求:', targetUrl, '端口:', port);
@@ -30,8 +30,8 @@ function doRequest(targetUrl, opts) {
     delete headers['connection'];
     delete headers['content-length'];
 
-    const proto = isHttps ? https : http;
-    const req = proto.request({ hostname, port, path: parsed.pathname + parsed.search, method: opts.method, headers }, (res) => {
+    const httpMod = isHttps ? https : http;
+    const req = httpMod.request({ hostname, port, path: parsed.pathname + parsed.search, method: opts.method, headers }, (res) => {
       console.log('← 响应状态:', res.statusCode);
       resolve(res);
     });
