@@ -1,83 +1,62 @@
 # BUAA iClass Sign-In
 
-BUAA 课程签到工具，前端通过调用 iClass API 实现查询和签到。
+BUAA 课程签到工具，基于智慧教室扫码签到 API 实现。
 
-## 部署方案：Cloudflare Pages（免费）
-
-本项目使用 **Cloudflare Pages** 托管，同时提供静态前端和 API 代理函数，无需自建服务器。
-
-### 目录结构
+## 架构
 
 ```
-/
-├── public/              # 静态文件（部署到 Pages）
-│   └── index.html      # 前端界面
-├── functions/api/       # Cloudflare Pages Functions（API 代理）
-│   └── index.js        # 登录 / 查课表 / 签到
-├── cloudflare-worker/   # 独立 Worker 版本（可选）
-├── .github/workflows/
-│   └── deploy.yml      # 自动部署到 Cloudflare Pages
-└── wrangler.toml       # Wrangler 配置
+public/          → 前端静态文件（Cloudflare Pages 托管）
+functions/api/   → Cloudflare Pages Functions（API 代理，解决跨域）
+BUAA-iClassSignIn-main/ → 独立 Python 版（无需网络）
 ```
 
-### 一键部署步骤
+## 部署到 Cloudflare Pages（免费）
 
-#### 1. Fork 本仓库
+### 方式：Dashboard 连接 GitHub（推荐）
 
-#### 2. 获取 Cloudflare API Token
+1. 打开 👉 https://dash.cloudflare.com/?to=/pages
+2. 点击 **"Create a project"**
+3. 选择 **"Import Git repository"**
+4. 选择仓库 `KaguraTart/BuaaSignIn`，分支选 `main`
+5. 构建设置：
+   - **Build command**：留空
+   - **Build output directory**：`public`
+6. 点击 **"Save and Deploy"**
 
-1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com)
-2. 进入 **My Profile** → **API Tokens**
-3. 点击 **Create Token** → **Create Custom Token**
-4. 配置权限：
-   - **Account** → **Cloudflare Pages**: `Edit`
-5. 复制生成的 Token
+部署完成后，访问 `https://buaa-iclass.<你的子域名>.pages.dev`
 
-#### 3. 获取 Cloudflare Account ID
+> 每次 push 到 `main` 分支都会自动重新部署。
 
-1. 在 [Cloudflare Dashboard](https://dash.cloudflare.com) 右上角点击头像
-2. 复制 **Account ID**
+### 重要：API 代理说明
 
-#### 4. 配置 GitHub Secrets
+BUAA iClass API (`iclass.buaa.edu.cn`) **没有 CORS 头**，浏览器直接调用会被拦截。
 
-在 GitHub 仓库的 **Settings** → **Secrets and variables** → **Actions** 中添加：
+本项目通过 `functions/api/index.js`（Cloudflare Pages Functions）代理请求：
+- `GET /api/status` — 健康检查
+- `GET /api/login?phone=学号` — 登录获取 session
+- `GET /api/schedule?dateStr=&userId=&sessionId=` — 查询课表
+- `POST /api/sign` body `{courseSchedId, userId}` — 签到
 
-| Secret Name | Value |
-|---|---|
-| `CLOUDFLARE_API_TOKEN` | 你的 Cloudflare API Token |
-| `CLOUDFLARE_ACCOUNT_ID` | 你的 Cloudflare Account ID |
+前端直接调用 `/api/*` 即可，由 Cloudflare 自动添加 CORS 头。
 
-#### 5. 推送代码
+## 独立 Python 版（无需部署）
 
-将代码推送到 `main` 分支，GitHub Actions 会自动：
-1. 构建前端
-2. 部署到 Cloudflare Pages
-3. API 函数自动响应 `/api/*` 路由
-
-部署完成后访问：`https://buaa-iclass.<your-account>.pages.dev`
-
-### 本地调试
+不想用网页版？`BUAA-iClassSignIn-main/` 目录下有独立的 Python 工具：
 
 ```bash
-# 安装 Wrangler
-npm install -g wrangler
+# 快速签到（只需学号）
+cd BUAA-iClassSignIn-main
+# 编辑 main.py，填入 student_id
+python main.py
 
-# 启动本地预览
-wrangler pages dev public
+# SSO 版（需要账号密码）
+# 编辑 password_ver.py，填入 stu_id 和 stu_pwd
+python password_ver.py
 
-# 预览带函数
-wrangler pages dev public --compatibility-flag=nodejs_compat
+# GUI 版
+pip install requests aiohttp
+python BUAA-iClassSignIn-main/remotesign/main.py
 ```
-
-### 本地开发（不依赖 Cloudflare）
-
-如果只想本地使用，可直接编辑 `BUAA-iClassSignIn-main/main.py`，填入学号后运行 `python main.py`。
-
-## 架构说明
-
-- **前端**（`public/`）：纯静态 HTML/JS/CSS，无构建步骤
-- **API 代理**（`functions/api/`）：Cloudflare Workers，将 iClass API 响应包装并添加 CORS 头，解决跨域问题
-- **自动部署**：GitHub Actions + Cloudflare Pages，push 即部署
 
 ## 免责声明
 
