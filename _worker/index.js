@@ -48,11 +48,19 @@ async function handleApi(request) {
       const text = await res.text();
       return json({
         status: res.status,
-        headers: Object.fromEntries(res.headers.entries()),
         body: text.substring(0, 300),
       });
     } catch (e) {
-      return json({ error: e.message });
+      return json({ error: e.message, name: e.name });
+    }
+  }
+  // 调试2：测试基本网络连通性
+  if (path === '/api/debug2') {
+    try {
+      const r = await fetch('https://www.cloudflare.com/');
+      return json({ cf_ok: true, status: r.status });
+    } catch (e) {
+      return json({ cf_ok: false, error: e.message });
     }
   }
   // 登录
