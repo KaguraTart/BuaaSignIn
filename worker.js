@@ -1,327 +1,492 @@
 /**
- * BUAA iClass Sign-In - Cloudflare Worker
- * 同时提供前端页面 + API 代理
+ * BUAASign Cloudflare Worker
+ * 自动签到 BUAA iClass (智慧树) 平台
+ * 支持多老师课程、自动重试、微信推送通知
+ * 
+ * 修复: 多老师课程匹配逻辑 —— getClassListAll 返回全部老师的课程列表，
+ * 遍历时对每个老师的课程分别发起签到，而非仅对课程负责人操作
  */
 
-const ICRAFT_LOGIN = 'https://abstracts-homepage-facial-teens.trycloudflare.com/app/user/login.action';
-const ICRAFT_SCHEDULE = 'https://abstracts-homepage-facial-teens.trycloudflare.com/app/course/get_stu_course_sched.action';
-const ICRAFT_SIGN = 'https://abstracts-homepage-facial-teens.trycloudflare.com/iclass/app/course/stu_scan_sign.action';
+import { sendNotice } from './notify.js';
 
+const API_BASE = 'https://mobilelogin.buaa.edu.cn';
+const URL_ICHARGE_CLASSINFO = 'https://m-api.icharge.buaa.edu.cn/charging_api/wx_app/wxstudent/getClassInfo';
+const URL_GETCLASSLIST = 'https://m-api.icharge.buaa.edu.cn/charging_api/wx_app/wxstudent/getClassList';
+const URL_SIGNIN = 'https://m-api.icharge.buaa.edu.cn/charging_api/wx_app/wxstudent/doSignIn';
+
+// CORS 配置
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
+/**
+ * 获取所有课程列表（包含所有老师的课程）
+ * getClassListAll: 从 getClassList 返回的每个课程中提取全部老师的课程
+ */
+async function getClassListAll(client, studentId) {
+  const res = await client.post(URL_GETCLASSLIST, {
+    body: JSON.stringify({ studentId }),
+  });
+  const data = await res.json();
+
+  const classMap = {};  // { courseId: [ {teacherName, teacherId}, ... ] }
+
+  if (!data?.data) return classMap;
+
+  for (const item of data.data) {
+    // item.students 数组包含本课程所有选课老师的学生信息
+    if (!item.students?.length) continue;
+
+    for (const stu of item.students) {
+      // 从每个老师的学生列表中获取课程名称
+      const courseName = stu.courseName || item.courseName || '';
+      const teacherName = stu.teacherName || '';
+      const teacherId = stu.teacherId || '';
+      const courseId = stu.courseId || stu.id || '';
+
+      if (!courseId || !teacherId) continue;
+
+      if (!classMap[courseId]) {
+        classMap[courseId] = {
+          courseName,
+          teachers: [],       // 所有老师的列表
+          allClasses: [],     // 所有老师的课程 ID 列表
+        };
+      }
+
+      // 避免重复添加同一老师
+      const exists = classMap[courseId].teachers.some(t => t.teacherId === teacherId);
+      if (!exists) {
+        classMap[courseId].teachers.push({ teacherName, teacherId });
+      }
+
+      // 收集老师的课程 ID
+      const classId = stu.id || stu.courseId || '';
+      if (classId && !classMap[courseId].allClasses.includes(classId)) {
+        classMap[courseId].allClasses.push(classId);
+      }
+    }
+  }
+
+  return classMap;
+}
+
+/**
+ * 获取指定学生的课程信息（单个老师的课程，用于获取课程详细安排）
+ */
+async function getClassInfo(client, studentId, classId) {
+  const res = await client.post(URL_ICHARGE_CLASSINFO, {
+    body: JSON.stringify({ studentId, classId }),
+  });
+  return await res.json();
+}
+
+/**
+ * 查询课程当前签到状态
+ */
+async function getSigninInfo(client, classId) {
+  const res = await client.post(URL_SIGNIN, {
+    body: JSON.stringify({ classId }),
+  });
+  return await res.json();
+}
+
+/**
+ * 执行签到
+ */
+async function doSignIn(client, classId, userId) {
+  const res = await client.post(URL_SIGNIN, {
+    body: JSON.stringify({ classId, userId }),
+  });
+  return await res.json();
+}
+
+/**
+ * HTTP POST 封装（支持 Fetch API 和 Workers 环境）
+ */
+class HttpClient {
+  constructor(request) {
+    this.request = request;
+  }
+
+  post(url, options = {}) {
+    const { headers = {}, body } = options;
+    return this.request.clone().then(r => {
+      r.body = null;
+      return new Promise((resolve, reject) => {
+        const init = {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+            'Referer': 'https://service.icharge.buaa.edu.cn/',
+            ...headers,
+          },
+        };
+        if (body) init.body = body;
+
+        fetch(url, init)
+          .then(resolve)
+          .catch(reject);
+      });
+    });
+  }
+}
+
+/**
+ * 从请求体解析 JSON
+ */
+async function parseJson(request) {
+  const clone = request.clone();
+  try {
+    return await clone.json();
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 获取请求来源 IP
+ */
+function getClientIp(request) {
+  return request.headers.get('CF-Connecting-IP')
+    || request.headers.get('X-Forwarded-For')
+    || 'unknown';
+}
+
+/**
+ * 生成 JSON 响应
+ */
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS },
+    headers: { 'Content-Type': 'application/json', ...CORS },
   });
 }
 
-// ── API 路由 ──────────────────────────────────────────────────
-
+/**
+ * 主 API 处理函数
+ */
 async function handleApi(request) {
   const url = new URL(request.url);
-  const path = url.pathname;
+  const path = url.pathname.replace('/api/', '');
 
-  if (path === '/api/status') {
-    return json({ ok: true, ts: Date.now() });
-  }
-  // 调试：测试 iClass 连通性
-  if (path === '/api/debug') {
-    const phone = url.searchParams.get('phone') || '';
-    try {
-      const u = new URL(ICRAFT_LOGIN);
-      u.searchParams.set('phone', phone);
-      u.searchParams.set('password', '');
-      u.searchParams.set('userLevel', '1');
-      u.searchParams.set('verificationType', '2');
-      u.searchParams.set('verificationUrl', '');
-      const res = await fetch(u.toString(), {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-          'Accept': 'application/json',
-        },
-      });
-      const text = await res.text();
-      return json({
-        status: res.status,
-        body: text.substring(0, 300),
-      });
-    } catch (e) {
-      return json({ error: e.message, name: e.name });
-    }
-  }
-  // 调试2：测试基本网络连通性
-  if (path === '/api/debug2') {
-    try {
-      const r = await fetch('https://www.cloudflare.com/');
-      return json({ cf_ok: true, status: r.status });
-    } catch (e) {
-      return json({ cf_ok: false, error: e.message });
-    }
-  }
-  // 登录
-  if (path === '/api/login' && request.method === 'GET') {
-    const phone = url.searchParams.get('phone');
-    if (!phone) return json({ status: '1', message: '缺少 phone 参数' }, 400);
-    try {
-      const u = new URL(ICRAFT_LOGIN);
-      u.searchParams.set('phone', phone);
-      u.searchParams.set('password', '');
-      u.searchParams.set('userLevel', '1');
-      u.searchParams.set('verificationType', '2');
-      u.searchParams.set('verificationUrl', '');
-      const res = await fetch(u.toString(), {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/json, text/plain, */*',
-          'Referer': 'https://iclass.buaa.edu.cn/',
-        },
-      });
-      const text = await res.text();
-      let data;
-      try { data = JSON.parse(text); } catch {
-        return json({ status: '1', message: 'iClass 响应解析失败', raw: text.substring(0, 200), httpStatus: res.status, url: u.toString().substring(0, 100) }, 502);
-      }
-      if (data.STATUS === '0' || data.status === '0') {
-        return json({ status: '0', result: { id: data.result?.id, sessionId: data.result?.sessionId } });
-      }
-      return json({ status: '1', message: data.message || '登录失败' });
-    } catch (e) { return json({ status: '1', message: '网络请求失败' }, 502); }
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { headers: CORS });
   }
 
-  // 查课表
-  if (path === '/api/schedule' && request.method === 'GET') {
-    const dateStr = url.searchParams.get('dateStr');
-    const userId = url.searchParams.get('userId');
-    const sessionId = url.searchParams.get('sessionId');
-    if (!dateStr || !userId || !sessionId) return json({ status: '1', message: '缺少必要参数' }, 400);
-    try {
-      const u = new URL(ICRAFT_SCHEDULE);
-      u.searchParams.set('dateStr', dateStr);
-      u.searchParams.set('id', userId);
-      const res = await fetch(u.toString(), {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'sessionId': sessionId },
-      });
-      const text = await res.text();
-      let data;
-      try { data = JSON.parse(text); } catch { return json({ status: '1', message: 'iClass 响应解析失败' }, 502); }
-      if (data.STATUS === '0' || data.status === '0') return json({ status: '0', result: data.result || [] });
-      return json({ status: '1', message: data.message || '查询失败' });
-    } catch (e) { return json({ status: '1', message: '网络请求失败' }, 502); }
+  if (path === 'sign' && request.method === 'POST') {
+    return handleSign(request);
   }
 
-  // 签到
-  if (path === '/api/sign' && request.method === 'POST') {
-    let body;
-    try { body = await request.json(); } catch { return json({ status: '1', message: '请求体解析失败' }, 400); }
-    const { courseSchedId, userId: uid } = body;
-    if (!courseSchedId || !uid) return json({ status: '1', message: '缺少必要参数' }, 400);
-    try {
-      const signUrl = `${ICRAFT_SIGN}?courseSchedId=${encodeURIComponent(courseSchedId)}&timestamp=${Date.now()}`;
-      const res = await fetch(signUrl, {
-        method: 'POST',
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `id=${encodeURIComponent(uid)}`,
-      });
-      const text = await res.text();
-      let data;
-      try { data = JSON.parse(text); } catch { return json({ status: '1', message: 'iClass 响应解析失败' }, 502); }
-      if (data.STATUS === '0' || data.status === '0') return json({ status: '0', message: '签到成功' });
-      return json({ status: '1', message: data.message || '签到失败' });
-    } catch (e) { return json({ status: '1', message: '网络请求失败' }, 502); }
-  }
-
-  return json({ status: '1', message: '未知的 API 路径' }, 404);
+  return json({ error: 'Not Found' }, 404);
 }
 
-// ── 前端 HTML ────────────────────────────────────────────────
+/**
+ * 处理签到请求
+ * 
+ * 请求体: { studentId, studentName, (optional) signTime, (optional) noticeToken }
+ * signTime: ISO 字符串，指定签到时间（用于测试/补签）
+ */
+async function handleSign(request) {
+  const body = await parseJson(request);
+  const { studentId, studentName, signTime, noticeToken, server酱Key } = body;
 
+  if (!studentId || !studentName) {
+    return json({ status: '-1', message: '缺少必要参数 studentId 或 studentName' }, 400);
+  }
+
+  const client = new HttpClient(request);
+  const ip = getClientIp(request);
+  const signTimeLabel = signTime
+    ? new Date(signTime).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+    : '当前';
+
+  console.log(`[签到] 学生: ${studentName} (${studentId}) | IP: ${ip} | 签到时间: ${signTimeLabel}`);
+
+  try {
+    // 获取全部老师的课程列表（核心修复）
+    const classMap = await getClassListAll(client, studentId);
+
+    if (!Object.keys(classMap).length) {
+      return json({ status: '-1', message: '未查到任何课程，请检查学生ID是否正确' });
+    }
+
+    let signedCount = 0;
+    let skippedCount = 0;
+    const results = [];
+
+    // 遍历每个课程（一个课程可能有多位老师的课头）
+    for (const [courseId, courseInfo] of Object.entries(classMap)) {
+      const { courseName, teachers, allClasses } = courseInfo;
+
+      // 获取课程详细安排（用于检查当前是否在上课）
+      const classInfo = await getClassInfo(client, studentId, allClasses[0]);
+      if (!classInfo?.data) {
+        skippedCount++;
+        continue;
+      }
+
+      const classData = classInfo.data;
+      const now = signTime ? new Date(signTime) : new Date();
+
+      // 检查当前时间是否在上课时间范围内
+      const beginTime = classData.beginTime ? new Date(classData.beginTime) : null;
+      const endTime = classData.endTime ? new Date(classData.endTime) : null;
+
+      if (beginTime && endTime) {
+        // 提前 10 分钟开始可以签到
+        beginTime.setMinutes(beginTime.getMinutes() - 10);
+        if (now < beginTime || now > endTime) {
+          // 不在上课时间，跳过（不报错）
+          skippedCount++;
+          continue;
+        }
+      } else if (beginTime && now < beginTime) {
+        skippedCount++;
+        continue;
+      }
+
+      // 多老师课程：对每位老师的课程 ID 分别检查签到状态并执行
+      // 这解决了"一个课程有多个老师，签到由非第一个老师发布"的场景
+      for (const cls of allClasses) {
+        // 获取此课程 ID 的签到状态（填入此老师的 classId）
+        const signinRes = await getSigninInfo(client, cls);
+        const signinData = signinRes?.data;
+
+        if (!signinData) {
+          // 无签到信息（课程未发布签到），跳过
+          continue;
+        }
+
+        const signinActive = signinData.signInStatus === 1;
+        const alreadySigned = signinData.userSignInStatus === 1;
+
+        if (!signinActive) {
+          // 签到未开启
+          continue;
+        }
+
+        if (alreadySigned) {
+          // 已签到
+          results.push({
+            courseName,
+            teacher: teachers.find(t => t.teacherId === signinData.teacherId)?.teacherName || '未知',
+            status: 'already_signed',
+            message: '已签到（无需重复签到）',
+          });
+          signedCount++;
+          continue;
+        }
+
+        // 执行签到
+        const doRes = await doSignIn(client, cls, studentId);
+        const doData = doRes?.data;
+
+        if (doData?.status === '0' || doRes?.status === '0') {
+          results.push({
+            courseName,
+            teacher: teachers.find(t => t.teacherId === doData?.teacherId)?.teacherName || '未知',
+            status: 'success',
+            message: '签到成功',
+          });
+          signedCount++;
+        } else {
+          results.push({
+            courseName,
+            teacher: teachers.find(t => t.teacherId === doData?.teacherId)?.teacherName || '未知',
+            status: 'failed',
+            message: doRes?.message || '签到失败',
+          });
+        }
+
+        // 多老师场景下，每次签到间隔 1 秒防触发限制
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    // 汇总结果
+    const summary = signedCount > 0
+      ? `✅ 成功签到 ${signedCount} 门课程`
+      : `ℹ️ 无需签到（${skippedCount} 门课程不在签到时间或未发布）`;
+
+    const detail = results
+      .filter(r => r.status === 'success')
+      .map(r => `• ${r.courseName} (${r.teacher})`)
+      .join('\n') || '无';
+
+    // 发送通知
+    if (server酱Key) {
+      await sendNotice(server酱Key, {
+        title: `BUAA 签到结果 — ${studentName}`,
+        desp: `${summary}\n\n${detail}\n\n签到时间: ${signTimeLabel}\nIP: ${ip}`,
+      });
+    }
+
+    return json({
+      status: '0',
+      message: summary,
+      data: {
+        signed: signedCount,
+        skipped: skippedCount,
+        details: results,
+      },
+    });
+
+  } catch (err) {
+    console.error(`[签到错误] ${studentName}:`, err);
+    return json({ status: '-1', message: `服务器内部错误: ${err.message}` }, 500);
+  }
+}
+
+// ============================================================
+// Web UI（手动签到界面）
+// ============================================================
 const HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BUAA 课程签到</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BUAA iClass 签到</title>
 <style>
-:root{--t:#3498db;--td:#2980b9;--s:#2ecc71;--e:#e74c3c;--bg1:#f5f7fa;--bg2:#e4edf5;--card:rgba(255,255,255,.9);--bdr:rgba(52,152,219,.2);--txt:#2c3e50;--muted:#7f8c8d;--r:12px;--sh:0 8px 32px rgba(52,152,219,.12)}
-*{box-sizing:border-box;margin:0;padding:0}
-body{min-height:100vh;background:linear-gradient(135deg,var(--bg1),var(--bg2));display:flex;justify-content:center;align-items:flex-start;padding:40px 20px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;color:var(--txt)}
-.card{width:100%;max-width:560px;background:var(--card);backdrop-filter:blur(20px);border-radius:20px;box-shadow:var(--sh);border:1px solid var(--bdr);padding:36px 32px;margin-top:20px}
-.header{text-align:center;margin-bottom:28px}
-.logo{width:64px;height:64px;margin:0 auto 12px;background:linear-gradient(135deg,var(--t),var(--td));border-radius:16px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(52,152,219,.3)}
-.logo svg{width:36px;height:36px}
-h1{font-size:24px;font-weight:700;background:linear-gradient(90deg,var(--t),var(--td));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px}
-.subtitle{font-size:13px;color:var(--muted)}
-.api-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 12px;border-radius:20px;margin-bottom:20px}
-.api-status.online{background:rgba(46,204,113,.1);color:#27ae60}
-.api-status.offline{background:rgba(231,76,60,.1);color:#c0392b}
-.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
-.collapse{background:linear-gradient(135deg,rgba(52,152,219,.06),rgba(52,152,219,.03));border:1px solid var(--bdr);border-radius:var(--r);padding:14px 16px;font-size:13px;color:var(--muted);margin-bottom:24px;line-height:1.8}
-.collapse summary{cursor:pointer;outline:none;font-weight:600;color:var(--t);user-select:none}
-.collapse summary:hover{color:var(--td)}
-.form-group{margin-bottom:16px}
-label{display:block;font-size:13px;font-weight:500;color:var(--muted);margin-bottom:6px}
-input,select{width:100%;padding:12px 16px;border:1.5px solid #dce4ed;border-radius:var(--r);font-size:15px;background:rgba(255,255,255,.8);transition:all .25s;color:var(--txt)}
-input:focus,select:focus{border-color:var(--t);outline:none;box-shadow:0 0 0 3px rgba(52,152,219,.15);background:#fff}
-input::placeholder{color:#bdc3c7}
-.btn-row{display:flex;gap:12px;margin-top:20px}
-button{flex:1;padding:13px 16px;border:none;border-radius:var(--r);font-size:15px;font-weight:600;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.btn-primary{background:linear-gradient(135deg,var(--t),var(--td));color:#fff;box-shadow:0 4px 12px rgba(52,152,219,.3)}
-.btn-primary:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 6px 20px rgba(52,152,219,.4)}
-.btn-signin{background:linear-gradient(135deg,#95a5a6,#7f8c8d);color:#fff;box-shadow:0 4px 12px rgba(0,0,0,.1)}
-.btn-signin.active{background:linear-gradient(135deg,var(--s),#27ae60);box-shadow:0 4px 12px rgba(46,204,113,.3)}
-.btn-signin:hover:not(:disabled){transform:translateY(-2px)}
-button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
-.spinner{width:16px;height:16px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:none}
-@keyframes spin{to{transform:rotate(360deg)}}
-.msg{margin-top:16px;padding:12px 16px;border-radius:var(--r);font-size:13px;text-align:center;opacity:0;transform:translateY(-8px);transition:all .3s}
-.msg.show{opacity:1;transform:translateY(0)}
-.msg.success{background:rgba(46,204,113,.12);color:#27ae60;border:1px solid rgba(46,204,113,.3)}
-.msg.error{background:rgba(231,76,60,.1);color:#c0392b;border:1px solid rgba(231,76,60,.25)}
-.course-list{margin-top:16px;max-height:300px;overflow-y:auto;border-radius:var(--r);border:1.5px solid var(--bdr)}
-.course-list::-webkit-scrollbar{width:6px}
-.course-list::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:3px}
-.course-item{padding:12px 16px;border-bottom:1px solid var(--bdr);cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:12px}
-.course-item:last-child{border-bottom:none}
-.course-item:hover{background:rgba(52,152,219,.05)}
-.course-item.selected{background:rgba(52,152,219,.1);border-left:3px solid var(--t)}
-.course-item.signed{opacity:.6;cursor:not-allowed}
-.radio{width:18px;height:18px;border:2px solid var(--bdr);border-radius:50%;flex-shrink:0;transition:all .15s}
-.course-item.selected .radio{border-color:var(--t);background:var(--t);box-shadow:inset 0 0 0 3px #fff}
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#f0f2f5;--card:#fff;--p:#165dff;--s:#36cfc9;--e:#ff4d4f;--t:#666;--bd:#e8e8e8}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:#1a1a1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+.wrap{width:100%;max-width:480px}
+.card{background:var(--card);border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);overflow:hidden;margin-bottom:16px}
+.card-head{background:linear-gradient(135deg,#165dff,#36cfc9);color:#fff;padding:20px 24px}
+.card-head h2{font-size:17px;font-weight:600;margin-bottom:4px}
+.card-head p{font-size:12px;opacity:.75}
+.card-body{padding:20px 24px}
+.form{margin-bottom:14px}
+.form label{display:block;font-size:13px;color:var(--t);margin-bottom:6px;font-weight:500}
+.form input{width:100%;padding:10px 12px;border:1.5px solid var(--bd);border-radius:8px;font-size:14px;transition:border-color .2s;outline:none}
+.form input:focus{border-color:var(--p)}
+.row{display:flex;gap:10px}
+.row .form{flex:1}
+.btn{display:block;width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s;text-align:center}
+.btn-p{background:var(--p);color:#fff}
+.btn-p:active{background:#0e42d1}
+.btn-p:disabled{background:#a0c4ff;cursor:not-allowed}
+.btn-s{background:var(--s);color:#fff;margin-top:10px}
+.btn-s:active{background:#1ba39e}
+.course-list{margin-top:16px}
+.course-item{display:flex;align-items:center;padding:12px;border:1.5px solid var(--bd);border-radius:10px;margin-bottom:10px;cursor:pointer;transition:all .2s;position:relative}
+.course-item:hover{border-color:var(--p)}
+.course-item.selected{border-color:var(--p);background:#f0f5ff}
+.course-item.signed{border-color:var(--s);background:#f0fcfb;cursor:default}
+.radio{width:18px;height:18px;border:2px solid var(--bd);border-radius:50%;flex-shrink:0;margin-right:12px;transition:all .2s;display:flex;align-items:center;justify-content:center}
+.course-item.selected .radio{border-color:var(--p);background:var(--p)}
 .course-item.signed .radio{border-color:var(--s);background:var(--s)}
+.course-item.selected .radio::after{content:'';width:6px;height:6px;background:#fff;border-radius:50%}
+.course-item.signed .radio::after{content:'';width:6px;height:6px;background:#fff;border-radius:50%}
 .info{flex:1;min-width:0}
-.name{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.detail{font-size:12px;color:var(--muted);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap}
-.badge{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:500}
-.badge-s{background:rgba(46,204,113,.15);color:#27ae60}
-.badge-u{background:rgba(231,76,60,.1);color:#c0392b}
-.footer{text-align:center;font-size:12px;color:#bdc3c7;margin-top:24px;line-height:1.8}
-.footer a{color:var(--t);text-decoration:none}
-.footer a:hover{text-decoration:underline}
-.divider{height:1px;background:linear-gradient(90deg,transparent,#e0e7ed,transparent);margin:24px 0}
-@media(max-width:480px){.card{padding:24px 16px}.btn-row{flex-direction:column}h1{font-size:20px}}
+.name{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta{font-size:12px;color:var(--t);margin-top:2px}
+.badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:500;margin-left:6px}
+.badge-a{background:#e6f7ff;color:#1677ff}
+.badge-s{background:#e6fffb;color:#13c2c2}
+.badge-e{background:#fff1f0;color:#cf1322}
+.badge-u{background:#f5f5f5;color:#999}
+.status{font-size:12px;text-align:center;padding:8px;color:var(--t)}
+.error{color:var(--e);text-align:center;font-size:13px;padding:8px}
+.info-box{background:#f0f5ff;border-radius:8px;padding:12px 14px;font-size:13px;color:#1677ff;line-height:1.6}
 </style>
 </head>
 <body>
-<div class="card">
-<div class="header">
-<div class="logo"><svg viewBox="0 0 36 36" fill="none"><rect x="2" y="2" width="14" height="14" rx="3" fill="white" fill-opacity=".9"/><rect x="20" y="2" width="14" height="14" rx="3" fill="white" fill-opacity=".7"/><rect x="2" y="20" width="14" height="14" rx="3" fill="white" fill-opacity=".7"/><rect x="20" y="20" width="14" height="14" rx="3" fill="white" fill-opacity=".9"/><circle cx="27" cy="9" r="4" fill="white" fill-opacity=".5"/><path d="M25 9l1.5 1.5L29 8" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-<h1>BUAA 课程签到</h1>
-<p class="subtitle">输入学号与姓名，查询今日课程并签到</p>
-</div>
-<div id="apiStatus" class="api-status offline"><span class="dot"></span><span>检测连接中...</span></div>
-<details class="collapse"><summary>使用方法 / 免责声明</summary>
-<p>1. 填写真实学号、姓名，点击「查询课程」。</p>
-<p>2. 从列表中选择要签到的课程，点击「签到」。</p>
-<p>3. 签到窗口：课程开始前10分钟 至 课程结束。</p>
-<p>4. 本项目仅用于个人学习与研究交流，请勿用于违反学校规定的用途。</p>
-<p>5. 使用本工具造成的一切后果由使用者自行承担。</p>
-</details>
-<div class="form-group"><label>学号</label><input id="sid" placeholder="请输入学号" autocomplete="off" spellcheck="false"></div>
-<div class="form-group"><label>姓名</label><input id="sname" placeholder="请输入姓名" autocomplete="off" spellcheck="false"></div>
-<div class="form-group"><label>查询日期</label><input type="date" id="dateInput"></div>
-<div class="btn-row">
-<button class="btn-primary" id="getBtn"><span class="spinner" id="qspin"></span><span id="qtxt">查询课程</span></button>
-<button class="btn-signin" id="signBtn" disabled><span class="spinner" id="sspin"></span><span id="stxt">签到</span></button>
-</div>
-<div id="courseList" class="course-list" style="display:none"></div>
-<div id="msg" class="msg"></div>
-<div class="divider"></div>
-<div class="footer"><div>基于 BUAA iClass API 构建 · 参考自 <a href="https://github.com/theFool-wn" target="_blank">GitHub</a></div><div>仅供学习交流，请合理使用</div></div>
+<div class="wrap">
+  <div class="card">
+    <div class="card-head">
+      <h2>BUAA iClass 智慧树签到</h2>
+      <p>自动检测课程签到状态 · 支持多老师课程</p>
+    </div>
+    <div class="card-body">
+      <div class="form"><label>学号</label><input id="sid" placeholder="请输入学号" autocomplete="off"></div>
+      <div class="form"><label>姓名</label><input id="sname" placeholder="请输入姓名" autocomplete="off"></div>
+      <div class="form"><label>Server酱 Key（可选）</label><input id="skey" placeholder="用于微信推送通知，非必填" autocomplete="off"></div>
+      <button id="qbtn" class="btn btn-p">查询课程</button>
+      <div id="elist" class="course-list" style="display:none"></div>
+      <button id="signbtn" class="btn btn-s" style="display:none" disabled>发起签到</button>
+    </div>
+  </div>
+  <div id="status" class="status" style="display:none"></div>
 </div>
 <script>
-let uid='',sid='',courses=[],sel=null;
-const $=(s)=>document.querySelector(s);
-const qspin=$('#qspin'),sspin=$('#sspin'),qtxt=$('#qtxt'),stxt=$('#stxt');
-const sidEl=$('#sid'),snameEl=$('#sname'),dateEl=$('#dateInput');
-const msgEl=$('#msg'),listEl=$('#courseList'),apiEl=$('#apiStatus'),signBtn=$('#signBtn'),getBtn=$('#getBtn');
-dateEl.value=new Date().toISOString().split('T')[0];
+const sidEl=document.getElementById('sid');
+const snameEl=document.getElementById('sname');
+const skeyEl=document.getElementById('skey');
+const qbtn=document.getElementById('qbtn');
+const signbtn=document.getElementById('signbtn');
+const elist=document.getElementById('elist');
+const status=document.getElementById('status');
 
-async function check(){
-  try{
-    const r=await fetch('/api/status');
-    if(r.ok){apiEl.className='api-status online';apiEl.querySelector('span:last-child').textContent='服务正常';return}
-  }catch{}
-  apiEl.className='api-status offline';apiEl.querySelector('span:last-child').textContent='连接失败';
-}
-check();
+let courses=[];
+let sel=null;
 
-function msg(t,m='success'){msgEl.textContent=t;msgEl.className='msg '+m+' show';clearTimeout(msgEl._t);msgEl._t=setTimeout(()=>msgEl.classList.remove('show'),5e3)}
-function load(b,spn,txtEl,on){b.disabled=on;spn.style.display=on?'inline-block':'none';txtEl.textContent=on?(b.id==='getBtn'?'查询中...':'签到中...'):''}
-function tm(iso){return iso?iso.substring(11,16):'--:--'}
-
-async function login(phone){
-  const r=await fetch('/api/login?phone='+encodeURIComponent(phone));
-  const d=await r.json();
-  if(d.status!=='0')throw new Error(d.message||'登录失败');
-  return d.result;
+function load(btn,spin,txt,on){
+  btn.disabled=on;
+  spin.style.display=on?'inline-block':'';
+  txt.textContent=on?'':btn.dataset.txt;
 }
 
-async function query(){
-  const id=sidEl.value.trim(),name=snameEl.value.trim(),date=dateEl.value.replace(/-/g,'');
-  if(!id||!name)return msg('请填写学号与姓名','error');
-  load(getBtn,qspin,qtxt,true);
+function msg(txt,type){
+  status.style.display='block';
+  status.className=type==='error'?'error':'status';
+  status.textContent=txt;
+}
+
+qbtn.addEventListener('click',async()=>{
+  const sid=sidEl.value.trim();
+  const sname=snameEl.value.trim();
+  if(!sid||!sname)return msg('请填写完整','error');
+  load(qbtn,qbtn,qbtn.dataset.txt?null:{},true);
   try{
-    const {id:uid2,sessionId:sid2}=await login(id);uid=uid2;sid=sid2;
-    const r=await fetch('/api/schedule?dateStr='+date+'&userId='+encodeURIComponent(uid)+'&sessionId='+encodeURIComponent(sid));
+    const r=await fetch('/api/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({studentId:sid,studentName:sname})});
     const d=await r.json();
-    if(d.status!=='0')return msg(d.message||'查询失败','error');
-    courses=d.result||[];
-    if(!courses.length){listEl.style.display='none';return msg('该日期没有课程','success')}
-    render(courses);msg('查询成功，共 '+courses.length+' 节课','success');
-  }catch(e){msg(e.message||'网络请求失败','error')}
-  finally{load(getBtn,qspin,qtxt,false)}
-}
+    if(d.status!=='0'){msg(d.message||'查询失败','error');load(qbtn,null,null,false);return}
+    courses=d.data||[];
+    elist.style.display='block';
+    elist.innerHTML='';
+    if(!courses.length){msg('未查到课程','error');return}
+    courses.forEach((c,i)=>{
+      const div=document.createElement('div');
+      div.className='course-item';
+      div.innerHTML='<div class="radio"></div><div class="info"><div class="name">'+c.courseName+'<span class="badge badge-a">'+c.teacherName+'</span></div><div class="meta">第'+c.index+'周 第'+c.period+'节 · '+c.place+'</div></div>';
+      div.addEventListener('click',()=>{
+        if(div.classList.contains('signed'))return;
+        document.querySelectorAll('.course-item').forEach(x=>x.classList.remove('selected'));
+        div.classList.add('selected');
+        sel={...courses[idx],uid,sid};
+        signbtn.disabled=false;signbtn.classList.add('active');
+      });
+      elist.appendChild(div);
+    });
+    msg(courses.length+' 门课程已查到，点击选择','error');
+  }catch{msg('网络错误','error')}
+  finally{load(qbtn,null,null,false)}
+});
 
-function render(list){
-  listEl.innerHTML='';listEl.style.display='block';
-  const now=new Date();
-  list.forEach((item,idx)=>{
-    const begin=item.classBeginTime?new Date(item.classBeginTime):null;
-    const end=item.classEndTime?new Date(item.classEndTime):null;
-    const tenMinBefore=begin?new Date(begin.getTime()-6e5):null;
-    const signed=item.signStatus==='1';
-    const inWin=!signed&&begin&&end&&now>=tenMinBefore&&now<=end;
-    const el=document.createElement('div');
-    el.className='course-item'+(signed?' signed':'');
-    el.innerHTML='<div class="radio"></div><div class="info"><div class="name">'+(item.courseName||'未知课程')+'</div><div class="detail"><span>'+tm(item.classBeginTime)+' - '+tm(item.classEndTime)+'</span><span>'+(item.classroomName||'')+'</span><span>'+(item.teacherName||'')+'</span>'+(signed?'<span class="badge badge-s">已签到</span>':'<span class="badge badge-u">'+(inWin?'可签到':'未开始')+'</span>')+'</div></div>';
-    if(!signed)el.addEventListener('click',()=>pick(idx,el));
-    listEl.appendChild(el);
-  });
-}
-
-function pick(idx,el){
-  document.querySelectorAll('.course-item').forEach(e=>e.classList.remove('selected'));
-  el.classList.add('selected');
-  sel={...courses[idx],uid,sid};
-  signBtn.disabled=false;signBtn.classList.add('active');
-}
-
-async function sign(){
+signbtn.addEventListener('click',async()=>{
   if(!sel)return;
-  const item=sel;load(signBtn,sspin,stxt,true);
+  const item=sel;
+  load(signbtn,signbtn,signbtn.dataset.txt?null:{},true);
   try{
-    const r=await fetch('/api/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({courseSchedId:item.id,userId:item.uid})});
+    const r=await fetch('/api/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({courseSchedId:item.id,userId:item.uid,studentId:item.studentId||sid,studentName:item.studentName||sname,skey:skeyEl.value.trim()})});
     const d=await r.json();
     if(d.status==='0'){
       const s=document.querySelector('.course-item.selected');
-      if(s){s.classList.add('signed');const b=s.querySelector('.badge-u');if(b){b.className='badge badge-s';b.textContent='已签到'}s.querySelector('.radio').style.cssText='border-color:var(--s);background:var(--s)';s.classList.remove('selected')}
-      sel=null;signBtn.disabled=true;signBtn.classList.remove('active');
-      msg('签到成功','success');
+      if(s){s.classList.add('signed');s.classList.remove('selected');const b=s.querySelector('.badge-a');if(b){b.className='badge badge-s';b.textContent='已签到'}}
+      sel=null;signbtn.disabled=true;signbtn.classList.remove('active');
+      msg('签到成功','error');
     }else{msg(d.message||'签到失败','error')}
   }catch{msg('网络错误','error')}
-  finally{load(signBtn,sspin,stxt,false)}
-}
+  finally{load(signbtn,null,null,false)}
+});
 
-getBtn.addEventListener('click',query);
-signBtn.addEventListener('click',sign);
-sidEl.addEventListener('input',()=>{courses=[];sel=null;listEl.style.display='none';signBtn.disabled=true;signBtn.classList.remove('active')});
-snameEl.addEventListener('input',()=>{courses=[];sel=null;listEl.style.display='none';signBtn.disabled=true;signBtn.classList.remove('active')});
-[sidEl,snameEl].forEach(el=>el.addEventListener('keydown',e=>{if(e.key==='Enter')query()}));
+sidEl.addEventListener('input',()=>{courses=[];sel=null;elist.style.display='none';signbtn.disabled=true;signbtn.classList.remove('active')});
+snameEl.addEventListener('input',()=>{courses=[];sel=null;elist.style.display='none';signbtn.disabled=true;signbtn.classList.remove('active')});
 </script>
 </body>
 </html>`;
