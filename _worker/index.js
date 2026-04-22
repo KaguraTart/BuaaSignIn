@@ -67,98 +67,38 @@ async function doSignOnce(sessionId, userId, courseSchedId, timestamp, retries =
 /**
  * 判断是否为 offset 相关错误
  */
-function isOffsetError(msg) {
-  return msg && (msg.includes('参数错误') || msg.includes('二维码已失效') || msg.includes('已失效'));
-}
-
 /**
- * 二分搜索找有效的 timestamp offset
+ * 快速探测有效 offset（QR码有效期极短，约20秒，无需深度搜索）
+ * 策略：按缓存值和相邻值快速探测，失败即放弃
  */
-async function binarySearchOffset(sessionId, userId, courseSchedId, baseTs) {
-  // 第一步：精细探测已知有效范围附近（off=-2000 实测成功）
-  const fineOffsets = [-3500, -3000, -2500, -2000, -1500, -1000, -500, 0];
-  for (const off of fineOffsets) {
-    if (off < OFFSET_MIN || off > OFFSET_MAX) continue;
+async function quickFindOffset(sessionId, userId, courseSchedId, baseTs) {
+  // 从缓存 offset + 相邻值开始，间隔 300ms
+  const base = _cachedOffset !== null ? _cachedOffset : -2000;
+  const candidates = [base, base - 200, base + 200, base - 400, base + 400, -2200, -1800, -2400, -1600];
+  const seen = new Set();
+  const unique = candidates.filter(o => {
+    if (seen.has(o) || o < OFFSET_MIN || o > OFFSET_MAX) return false;
+    seen.add(o); return true;
+  });
+
+  for (const off of unique) {
     await new Promise(r => setTimeout(r, 300));
     const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + off));
     if (data.STATUS === '0') {
-      console.log(`[offset搜索] 精细扫描成功！offset=${off}`);
-      return off;
+      console.log(`[offset] 成功！offset=${off}`);
+      return { offset: off, data };
     }
+    console.log(`[offset] off=${off} => ${data.ERRMSG || data.message}`);
   }
-
-  // 第二步：宽范围二分搜索
-  let lo = OFFSET_MIN, hi = OFFSET_MAX;
-  while (lo < hi - 1) {
-    const mid = Math.floor((lo + hi) / 2);
-    const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + mid));
-    if (data.STATUS === '0') {
-      console.log(`[offset搜索] 二分成功！offset=${mid}`);
-      return mid;
-    }
-    const msg = data.ERRMSG || data.message || '';
-    if (msg.includes('参数错误')) {
-      hi = mid;
-    } else if (msg.includes('二维码已失效') || msg.includes('已失效')) {
-      lo = mid;
-    } else {
-      console.log(`[offset搜索] 非offset错误: ${msg}`);
-      return null;
-    }
-    await new Promise(r => setTimeout(r, 300));
-  }
-
-  // 第三步：边界值探测
-  for (const off of [lo, lo + 1, hi - 1, hi]) {
-    if (off < OFFSET_MIN || off > OFFSET_MAX) continue;
-    await new Promise(r => setTimeout(r, 500));
-    const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + off));
-    if (data.STATUS === '0') {
-      console.log(`[offset搜索] 边界成功！offset=${off}`);
-      return off;
-    }
-  }
-  console.log(`[offset搜索] 失败`);
-  return null;
+  return { offset: null, data: { ERRMSG: '签到未开放或已结束，请稍后再试' } };
 }
 
 /**
- * 带 offset 补偿的签到（先试缓存，再二分搜索）
+ * 带 offset 补偿的签到
  */
 async function doSignWithOffset(sessionId, userId, courseSchedId) {
   const baseTs = Date.now();
-
-  // 优先用缓存的 offset
-  if (_cachedOffset !== null) {
-    const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + _cachedOffset));
-    const status = data.STATUS || data.status || '';
-    const msg = data.ERRMSG || data.message || '';
-
-    if (status === '0') return { offset: _cachedOffset, data };
-    if (!isOffsetError(msg)) return { offset: null, data };
-
-    console.log(`[签到] 缓存 offset=${_cachedOffset} 失效，进行二分搜索`);
-    _cachedOffset = null;
-  }
-
-  // 二分搜索新 offset
-  const newOffset = await binarySearchOffset(sessionId, userId, courseSchedId, baseTs);
-
-  if (newOffset === null) {
-    // 兜底：试接近已知有效范围的值
-    for (const off of [-4000, -3000, -2000, -1500, -1000, -500]) {
-      const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + off));
-      if (data.STATUS === '0') {
-        _cachedOffset = off;
-        return { offset: off, data };
-      }
-    }
-    return { offset: null, data: null };
-  }
-
-  _cachedOffset = newOffset;
-  const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + newOffset));
-  return { offset: newOffset, data };
+  return quickFindOffset(sessionId, userId, courseSchedId, baseTs);
 }
 
 function json(data, status = 200) {
