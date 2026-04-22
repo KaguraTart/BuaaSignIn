@@ -6,13 +6,13 @@
  * iClass 扫码签到接口对时间戳有校验，没有精确 offset 会报「参数错误」
  */
 
-const ICRAFT_LOGIN = 'https://abstracts-homepage-facial-teens.trycloudflare.com/app/user/login.action';
-const ICRAFT_SCHEDULE = 'https://abstracts-homepage-facial-teens.trycloudflare.com/app/course/get_stu_course_sched.action';
-const ICRAFT_SIGN = 'https://abstracts-homepage-facial-teens.trycloudflare.com/iclass/app/course/stu_scan_sign.action';
+const ICRAFT_LOGIN = 'https://incoming-flying-assistant-occupations.trycloudflare.com/app/user/login.action';
+const ICRAFT_SCHEDULE = 'https://incoming-flying-assistant-occupations.trycloudflare.com/app/course/get_stu_course_sched.action';
+const ICRAFT_SIGN = 'https://incoming-flying-assistant-occupations.trycloudflare.com/iclass/app/course/stu_scan_sign.action';
 
-// Offset 搜索范围（毫秒，与 daemon.py 保持一致）
-const OFFSET_MIN = -15000;
-const OFFSET_MAX = -1000;
+// Offset 搜索范围（毫秒，略宽于 daemon.py 的 [-15000, -1000]）
+const OFFSET_MIN = -20000;
+const OFFSET_MAX = -500;
 
 // 缓存 offset 到 Worker KV（跨请求复用）
 // 如果没有 KV，则用内存缓存（单 Worker 实例内有效）
@@ -25,21 +25,30 @@ const CORS = {
 };
 
 /**
- * 单次签到请求（用于 offset 搜索）
+ * 单次签到请求（用于 offset 搜索），带重试
  */
-async function doSignOnce(sessionId, userId, courseSchedId, timestamp) {
-  const signUrl = `${ICRAFT_SIGN}?courseSchedId=${encodeURIComponent(courseSchedId)}&timestamp=${timestamp}`;
-  const res = await fetch(signUrl, {
-    method: 'POST',
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 wxwork/4.1.22 MicroMessenger/7.0.1 NetType/WIFI Language/zh ColorScheme/Light',
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Sessionid': sessionId,
-    },
-    body: `id=${encodeURIComponent(userId)}`,
-  });
-  const text = await res.text();
-  try { return JSON.parse(text); } catch { return { status: '1', message: '响应解析失败' }; }
+async function doSignOnce(sessionId, userId, courseSchedId, timestamp, retries = 2) {
+  const lastErr = { status: '1', message: '响应解析失败' };
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const signUrl = `${ICRAFT_SIGN}?courseSchedId=${encodeURIComponent(courseSchedId)}&timestamp=${timestamp}`;
+      const res = await fetch(signUrl, {
+        method: 'POST',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 wxwork/4.1.22 MicroMessenger/7.0.1 NetType/WIFI Language/zh ColorScheme/Light',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Sessionid': sessionId,
+        },
+        body: `id=${encodeURIComponent(userId)}`,
+      });
+      const text = await res.text();
+      try { return JSON.parse(text); } catch { lastErr.message = '响应解析失败'; }
+    } catch (e) {
+      lastErr.message = '网络错误: ' + e.message;
+      if (attempt < retries) await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  return lastErr;
 }
 
 /**
