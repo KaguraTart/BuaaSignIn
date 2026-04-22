@@ -6,17 +6,18 @@
  * iClass 扫码签到接口对时间戳有校验，没有精确 offset 会报「参数错误」
  */
 
-const ICRAFT_LOGIN = 'https://incoming-flying-assistant-occupations.trycloudflare.com/app/user/login.action';
-const ICRAFT_SCHEDULE = 'https://incoming-flying-assistant-occupations.trycloudflare.com/app/course/get_stu_course_sched.action';
-const ICRAFT_SIGN = 'https://incoming-flying-assistant-occupations.trycloudflare.com/iclass/app/course/stu_scan_sign.action';
+// iClass 内部 API 服务器（公网可达）
+const ICRAFT_LOGIN = 'https://iclass.buaa.edu.cn:8347/app/user/login.action';
+const ICRAFT_SCHEDULE = 'https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action';
+const ICRAFT_SIGN = 'http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action';
 
-// Offset 搜索范围（毫秒，略宽于 daemon.py 的 [-15000, -1000]）
-const OFFSET_MIN = -20000;
-const OFFSET_MAX = -500;
+// Offset 搜索范围（毫秒）
+// 实测 off=-2000 成功，off=0 报参数错误，有效范围很窄
+const OFFSET_MIN = -5000;
+const OFFSET_MAX = 500;
 
-// 缓存 offset 到 Worker KV（跨请求复用）
-// 如果没有 KV，则用内存缓存（单 Worker 实例内有效）
-let _cachedOffset = null;
+// 缓存 offset（实测 off=-2000 有效，作为默认值）
+let _cachedOffset = -2000;
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -25,14 +26,26 @@ const CORS = {
 };
 
 /**
- * 单次签到请求（用于 offset 搜索），带重试
+ * 带超时的 fetch（接口响应慢，约 6 秒）
+ */
+function fetchWithTimeout(url, options, timeoutMs = 15000) {
+  return Promise.race([
+    fetch(url, options),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('请求超时')), timeoutMs)
+    ),
+  ]);
+}
+
+/**
+ * 单次签到请求（用于 offset 搜索），带超时和重试
  */
 async function doSignOnce(sessionId, userId, courseSchedId, timestamp, retries = 2) {
-  const lastErr = { status: '1', message: '响应解析失败' };
+  const lastErr = { STATUS: '1', ERRMSG: '响应解析失败' };
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const signUrl = `${ICRAFT_SIGN}?courseSchedId=${encodeURIComponent(courseSchedId)}&timestamp=${timestamp}`;
-      const res = await fetch(signUrl, {
+      const res = await fetchWithTimeout(signUrl, {
         method: 'POST',
         headers: {
           'User-Agent': 'Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 wxwork/4.1.22 MicroMessenger/7.0.1 NetType/WIFI Language/zh ColorScheme/Light',
@@ -40,12 +53,12 @@ async function doSignOnce(sessionId, userId, courseSchedId, timestamp, retries =
           'Sessionid': sessionId,
         },
         body: `id=${encodeURIComponent(userId)}`,
-      });
+      }, 15000);
       const text = await res.text();
-      try { return JSON.parse(text); } catch { lastErr.message = '响应解析失败'; }
+      try { return JSON.parse(text); } catch { lastErr.ERRMSG = '响应解析失败'; }
     } catch (e) {
-      lastErr.message = '网络错误: ' + e.message;
-      if (attempt < retries) await new Promise(r => setTimeout(r, 1000));
+      lastErr.ERRMSG = '网络错误: ' + e.message;
+      if (attempt < retries) await new Promise(r => setTimeout(r, 2000));
     }
   }
   return lastErr;
@@ -62,33 +75,50 @@ function isOffsetError(msg) {
  * 二分搜索找有效的 timestamp offset
  */
 async function binarySearchOffset(sessionId, userId, courseSchedId, baseTs) {
-  let lo = OFFSET_MIN, hi = OFFSET_MAX;
+  // 第一步：精细探测已知有效范围附近（off=-2000 实测成功）
+  const fineOffsets = [-3500, -3000, -2500, -2000, -1500, -1000, -500, 0];
+  for (const off of fineOffsets) {
+    if (off < OFFSET_MIN || off > OFFSET_MAX) continue;
+    await new Promise(r => setTimeout(r, 300));
+    const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + off));
+    if (data.STATUS === '0') {
+      console.log(`[offset搜索] 精细扫描成功！offset=${off}`);
+      return off;
+    }
+  }
 
+  // 第二步：宽范围二分搜索
+  let lo = OFFSET_MIN, hi = OFFSET_MAX;
   while (lo < hi - 1) {
     const mid = Math.floor((lo + hi) / 2);
     const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + mid));
-    const status = data.STATUS || data.status || '';
+    if (data.STATUS === '0') {
+      console.log(`[offset搜索] 二分成功！offset=${mid}`);
+      return mid;
+    }
     const msg = data.ERRMSG || data.message || '';
-
-    if (status === '0') return mid;
-
     if (msg.includes('参数错误')) {
       hi = mid;
     } else if (msg.includes('二维码已失效') || msg.includes('已失效')) {
       lo = mid;
     } else {
-      // 非 offset 错误，说明接口本身有问题，停止搜索
       console.log(`[offset搜索] 非offset错误: ${msg}`);
       return null;
     }
+    await new Promise(r => setTimeout(r, 300));
   }
 
-  // 尝试边界值
+  // 第三步：边界值探测
   for (const off of [lo, lo + 1, hi - 1, hi]) {
     if (off < OFFSET_MIN || off > OFFSET_MAX) continue;
+    await new Promise(r => setTimeout(r, 500));
     const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + off));
-    if ((data.STATUS === '0' || data.status === '0')) return off;
+    if (data.STATUS === '0') {
+      console.log(`[offset搜索] 边界成功！offset=${off}`);
+      return off;
+    }
   }
+  console.log(`[offset搜索] 失败`);
   return null;
 }
 
@@ -115,10 +145,10 @@ async function doSignWithOffset(sessionId, userId, courseSchedId) {
   const newOffset = await binarySearchOffset(sessionId, userId, courseSchedId, baseTs);
 
   if (newOffset === null) {
-    // 兜底：试几个常见值
-    for (const off of [-9000, -8000, -7000, -6000, -5000]) {
+    // 兜底：试接近已知有效范围的值
+    for (const off of [-4000, -3000, -2000, -1500, -1000, -500]) {
       const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + off));
-      if ((data.STATUS === '0' || data.status === '0')) {
+      if (data.STATUS === '0') {
         _cachedOffset = off;
         return { offset: off, data };
       }
@@ -241,12 +271,17 @@ async function handleApi(request) {
     if (!sid) return json({ status: '1', message: '缺少 sessionId，请先调用登录接口' }, 400);
     try {
       const { offset, data } = await doSignWithOffset(sid, uid, courseSchedId);
-      if (!data) return json({ status: '1', message: '签到失败：无法找到有效 offset' }, 502);
+      if (!data) return json({ status: '1', message: '签到未开放（二维码已失效），请稍后再试' }, 200);
       if (data.STATUS === '0' || data.status === '0') {
+        _cachedOffset = offset; // 更新缓存
         return json({ status: '0', message: `签到成功 (offset=${offset})` });
       }
-      return json({ status: '1', message: data.message || '签到失败' });
-    } catch (e) { return json({ status: '1', message: '网络请求失败' }, 502); }
+      const msg = data.ERRMSG || data.message || '';
+      if (msg.includes('二维码已失效') || msg.includes('已失效')) {
+        return json({ status: '1', message: '签到未开放或已结束，请稍后再试' }, 200);
+      }
+      return json({ status: '1', message: msg || '签到失败' });
+    } catch (e) { return json({ status: '1', message: '网络请求失败: ' + e.message }, 502); }
   }
 
   // 查询当前缓存的 offset（调试用）
