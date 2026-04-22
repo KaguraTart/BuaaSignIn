@@ -1,17 +1,126 @@
 /**
  * BUAA iClass Sign-In - Cloudflare Worker
  * 同时提供前端页面 + API 代理
+ *
+ * 2026-04-22 修复: 添加 timestamp offset 二分搜索，参考 buaasign_daemon.py
+ * iClass 扫码签到接口对时间戳有校验，没有精确 offset 会报「参数错误」
  */
 
 const ICRAFT_LOGIN = 'https://abstracts-homepage-facial-teens.trycloudflare.com/app/user/login.action';
 const ICRAFT_SCHEDULE = 'https://abstracts-homepage-facial-teens.trycloudflare.com/app/course/get_stu_course_sched.action';
 const ICRAFT_SIGN = 'https://abstracts-homepage-facial-teens.trycloudflare.com/iclass/app/course/stu_scan_sign.action';
 
+// Offset 搜索范围（毫秒，与 daemon.py 保持一致）
+const OFFSET_MIN = -15000;
+const OFFSET_MAX = -1000;
+
+// 缓存 offset 到 Worker KV（跨请求复用）
+// 如果没有 KV，则用内存缓存（单 Worker 实例内有效）
+let _cachedOffset = null;
+
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 };
+
+/**
+ * 单次签到请求（用于 offset 搜索）
+ */
+async function doSignOnce(sessionId, userId, courseSchedId, timestamp) {
+  const signUrl = `${ICRAFT_SIGN}?courseSchedId=${encodeURIComponent(courseSchedId)}&timestamp=${timestamp}`;
+  const res = await fetch(signUrl, {
+    method: 'POST',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 wxwork/4.1.22 MicroMessenger/7.0.1 NetType/WIFI Language/zh ColorScheme/Light',
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Sessionid': sessionId,
+    },
+    body: `id=${encodeURIComponent(userId)}`,
+  });
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return { status: '1', message: '响应解析失败' }; }
+}
+
+/**
+ * 判断是否为 offset 相关错误
+ */
+function isOffsetError(msg) {
+  return msg && (msg.includes('参数错误') || msg.includes('二维码已失效') || msg.includes('已失效'));
+}
+
+/**
+ * 二分搜索找有效的 timestamp offset
+ */
+async function binarySearchOffset(sessionId, userId, courseSchedId, baseTs) {
+  let lo = OFFSET_MIN, hi = OFFSET_MAX;
+
+  while (lo < hi - 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + mid));
+    const status = data.STATUS || data.status || '';
+    const msg = data.ERRMSG || data.message || '';
+
+    if (status === '0') return mid;
+
+    if (msg.includes('参数错误')) {
+      hi = mid;
+    } else if (msg.includes('二维码已失效') || msg.includes('已失效')) {
+      lo = mid;
+    } else {
+      // 非 offset 错误，说明接口本身有问题，停止搜索
+      console.log(`[offset搜索] 非offset错误: ${msg}`);
+      return null;
+    }
+  }
+
+  // 尝试边界值
+  for (const off of [lo, lo + 1, hi - 1, hi]) {
+    if (off < OFFSET_MIN || off > OFFSET_MAX) continue;
+    const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + off));
+    if ((data.STATUS === '0' || data.status === '0')) return off;
+  }
+  return null;
+}
+
+/**
+ * 带 offset 补偿的签到（先试缓存，再二分搜索）
+ */
+async function doSignWithOffset(sessionId, userId, courseSchedId) {
+  const baseTs = Date.now();
+
+  // 优先用缓存的 offset
+  if (_cachedOffset !== null) {
+    const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + _cachedOffset));
+    const status = data.STATUS || data.status || '';
+    const msg = data.ERRMSG || data.message || '';
+
+    if (status === '0') return { offset: _cachedOffset, data };
+    if (!isOffsetError(msg)) return { offset: null, data };
+
+    console.log(`[签到] 缓存 offset=${_cachedOffset} 失效，进行二分搜索`);
+    _cachedOffset = null;
+  }
+
+  // 二分搜索新 offset
+  const newOffset = await binarySearchOffset(sessionId, userId, courseSchedId, baseTs);
+
+  if (newOffset === null) {
+    // 兜底：试几个常见值
+    for (const off of [-9000, -8000, -7000, -6000, -5000]) {
+      const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + off));
+      if ((data.STATUS === '0' || data.status === '0')) {
+        _cachedOffset = off;
+        return { offset: off, data };
+      }
+    }
+    return { offset: null, data: null };
+  }
+
+  _cachedOffset = newOffset;
+  const data = await doSignOnce(sessionId, userId, courseSchedId, String(baseTs + newOffset));
+  return { offset: newOffset, data };
+}
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -114,25 +223,32 @@ async function handleApi(request) {
     } catch (e) { return json({ status: '1', message: '网络请求失败' }, 502); }
   }
 
-  // 签到
+  // 签到（带 offset 二分搜索）
   if (path === '/api/sign' && request.method === 'POST') {
     let body;
     try { body = await request.json(); } catch { return json({ status: '1', message: '请求体解析失败' }, 400); }
-    const { courseSchedId, userId: uid } = body;
+    const { courseSchedId, userId: uid, sessionId: sid } = body;
     if (!courseSchedId || !uid) return json({ status: '1', message: '缺少必要参数' }, 400);
+    if (!sid) return json({ status: '1', message: '缺少 sessionId，请先调用登录接口' }, 400);
     try {
-      const signUrl = `${ICRAFT_SIGN}?courseSchedId=${encodeURIComponent(courseSchedId)}&timestamp=${Date.now()}`;
-      const res = await fetch(signUrl, {
-        method: 'POST',
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `id=${encodeURIComponent(uid)}`,
-      });
-      const text = await res.text();
-      let data;
-      try { data = JSON.parse(text); } catch { return json({ status: '1', message: 'iClass 响应解析失败' }, 502); }
-      if (data.STATUS === '0' || data.status === '0') return json({ status: '0', message: '签到成功' });
+      const { offset, data } = await doSignWithOffset(sid, uid, courseSchedId);
+      if (!data) return json({ status: '1', message: '签到失败：无法找到有效 offset' }, 502);
+      if (data.STATUS === '0' || data.status === '0') {
+        return json({ status: '0', message: `签到成功 (offset=${offset})` });
+      }
       return json({ status: '1', message: data.message || '签到失败' });
     } catch (e) { return json({ status: '1', message: '网络请求失败' }, 502); }
+  }
+
+  // 查询当前缓存的 offset（调试用）
+  if (path === '/api/offset' && request.method === 'GET') {
+    return json({ offset: _cachedOffset });
+  }
+
+  // 清除 offset 缓存（调试用）
+  if (path === '/api/offset' && request.method === 'DELETE') {
+    _cachedOffset = null;
+    return json({ message: 'offset 缓存已清除' });
   }
 
   return json({ status: '1', message: '未知的 API 路径' }, 404);
@@ -305,13 +421,13 @@ async function sign(){
   if(!sel)return;
   const item=sel;load(signBtn,sspin,stxt,true);
   try{
-    const r=await fetch('/api/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({courseSchedId:item.id,userId:item.uid})});
+    const r=await fetch('/api/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({courseSchedId:item.id,userId:item.uid,sessionId:item.sid})});
     const d=await r.json();
     if(d.status==='0'){
       const s=document.querySelector('.course-item.selected');
       if(s){s.classList.add('signed');const b=s.querySelector('.badge-u');if(b){b.className='badge badge-s';b.textContent='已签到'}s.querySelector('.radio').style.cssText='border-color:var(--s);background:var(--s)';s.classList.remove('selected')}
       sel=null;signBtn.disabled=true;signBtn.classList.remove('active');
-      msg('签到成功','success');
+      msg('签到成功 '+d.message,'success');
     }else{msg(d.message||'签到失败','error')}
   }catch{msg('网络错误','error')}
   finally{load(signBtn,sspin,stxt,false)}
