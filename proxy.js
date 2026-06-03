@@ -20,78 +20,278 @@ function sendJson(res, data, status = 200) {
   res.end(JSON.stringify(data));
 }
 
-function collectBody(res) {
-  return new Promise((resolve) => {
-    const chunks = [];
-    res.on('data', c => chunks.push(c));
-    res.on('end', () => resolve(Buffer.concat(chunks)));
+function logReq(...args) { const ts = new Date().toISOString().slice(11, 23); console.log(`[${ts}]`, ...args); }
+
+// 简单的同步 cookie 存储，按 cookie 自己的 Domain 属性分组
+class CookieStore {
+  constructor() { this.jar = new Map(); }  // domain (with leading dot or exact) -> Map(name -> value)
+  ingest(urlStr, setCookieHeaders) {
+    if (!setCookieHeaders) return;
+    const arr = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+    const u = new URL(urlStr);
+    for (const sc of arr) {
+      const parts = sc.split(';').map(s => s.trim());
+      const first = parts[0];
+      const eq = first.indexOf('=');
+      if (eq < 0) continue;
+      const name = first.slice(0, eq).trim();
+      const value = first.slice(eq + 1).trim();
+      // 解析 Domain 属性
+      let domain = u.hostname;
+      for (const p of parts.slice(1)) {
+        const [k, ...vs] = p.split('=');
+        if (k.toLowerCase() === 'domain' && vs.length) {
+          domain = vs.join('=').trim().toLowerCase();
+          if (!domain.startsWith('.')) domain = '.' + domain;
+        }
+      }
+      if (!this.jar.has(domain)) this.jar.set(domain, new Map());
+      this.jar.get(domain).set(name, value);
+    }
+  }
+  header(urlStr) {
+    const u = new URL(urlStr);
+    const host = u.hostname.toLowerCase();
+    // 收集所有匹配 host 的 cookie：精确匹配 + 以 .domain 形式匹配子域
+    const cookies = [];
+    for (const [dom, m] of this.jar) {
+      const bare = dom.startsWith('.') ? dom.slice(1) : dom;
+      if (host === bare || host.endsWith('.' + bare)) {
+        for (const [k, v] of m) cookies.push(`${k}=${v}`);
+      }
+    }
+    return cookies.join('; ');
+  }
+}
+
+// 根据 path 推断端口/协议（2026.06 新版路由）
+//  - app/common/get_timestamp    → 8081 (HTTP, 时间戳校准)
+//  - eschool/app/course/...      → 8081 (HTTP, 签到)
+//  - eschool/app/user/login_buaa → 8346 (HTTPS, 登录)
+//  - 其他 /app/...               → 8347 (HTTPS, 课表等)
+function pickRoute(path) {
+  if (path.includes('/app/common/get_timestamp')) return { port: 8081, https: false };
+  if (path.includes('/eschool/app/course/')) return { port: 8081, https: false };
+  if (path.includes('/eschool/app/user/login_buaa')) return { port: 8346, https: true };
+  return { port: 8347, https: true };
+}
+
+// 通用 HTTP 请求：支持 cookie 存储、跟随重定向、强制协议、保留指定 header
+// opts: { method, headers, body, cookieStore, keepHeaders (key set), dropCookie (bool) }
+// 返回的 res 会被注入 .url = 最终 URL（跟随重定向后）
+function rawRequest(urlStr, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const lib = urlStr.startsWith('https') ? https : http;
+    const followChain = (u, lastUrl) => {
+      const p = new URL(u);
+      const reqHeaders = { ...(opts.headers || {}) };
+      if (opts.cookieStore && !opts.dropCookie) {
+        const ck = opts.cookieStore.header(u);
+        if (ck) reqHeaders['Cookie'] = ck;
+      } else if (opts.dropCookie) {
+        delete reqHeaders['Cookie'];
+      }
+      const reqOpts = {
+        hostname: p.hostname,
+        port: p.port || (p.protocol === 'https:' ? 443 : 80),
+        path: p.pathname + p.search,
+        method: opts.method || 'GET',
+        headers: reqHeaders,
+        rejectUnauthorized: false,
+      };
+      const req = lib.request(reqOpts, (res) => {
+        if (opts.cookieStore && res.headers['set-cookie']) {
+          opts.cookieStore.ingest(u, res.headers['set-cookie']);
+        }
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          let loc = res.headers.location;
+          if (opts.forceHttps && loc.startsWith('http://')) loc = loc.replace('http://', 'https://');
+          const next = new URL(loc, u).toString();
+          res.resume();
+          const newHeaders = {};
+          if (opts.keepHeaders) {
+            for (const k of opts.keepHeaders) {
+              if (opts.headers && opts.headers[k] != null) newHeaders[k] = opts.headers[k];
+            }
+          }
+          followChain(next, next);
+          return;
+        }
+        let body = '';
+        res.on('data', c => body += c);
+        res.on('end', () => {
+          res.body = body;
+          res.url = lastUrl;
+          resolve(res);
+        });
+      });
+      req.on('error', reject);
+      if (opts.body) req.write(opts.body);
+      req.end();
+    };
+    followChain(urlStr, urlStr);
   });
 }
 
-// 直接请求 iClass，自动跟随重定向并强制 HTTPS
-async function iClassFetch(path, opts = {}) {
-  const isHttps = true;
-  const port = path.includes('8081') ? 8081 : 8347;
+// 在 body 中按 left/right 标签提取字符串
+function parseTag(body, left, right) {
+  const i = body.indexOf(left);
+  if (i < 0) return null;
+  const s = i + left.length;
+  const e = right ? body.indexOf(right, s) : body.length;
+  if (e < 0) return null;
+  return body.substring(s, e);
+}
 
-  // 构建查询字符串
-  let urlStr = `https://iclass.buaa.edu.cn:${port}${path}`;
-  const parsedUrl = new URL(urlStr);
-  const targetPath = parsedUrl.pathname + parsedUrl.search;
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0';
 
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'iclass.buaa.edu.cn',
-      port,
-      path: targetPath,
-      method: opts.method || 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': 'https://iclass.buaa.edu.cn/',
-        'Accept-Encoding': 'identity',
-        ...(opts.headers || {}),
-      },
-      rejectUnauthorized: false,
-    }, async (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', async () => {
-        // 跟随重定向
-        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-          let loc = res.headers.location;
-          // 强制 HTTPS
-          if (loc.startsWith('http://')) loc = loc.replace('http://', 'https://');
-          const redirectUrl = new URL(loc, urlStr).toString();
-          const redirectParsed = new URL(redirectUrl);
-          const redirectPort = redirectParsed.port || 443;
-          const redirectReq = https.request({
-            hostname: redirectParsed.hostname,
-            port: redirectPort,
-            path: redirectParsed.pathname + redirectParsed.search,
-            method: opts.method || 'GET',
-            headers: req.getHeaders ? req.getHeaders() : (opts.headers || {}),
-            rejectUnauthorized: false,
-          }, (r) => {
-            let b = '';
-            r.on('data', c => b += c);
-            r.on('end', () => {
-              r.body = b;
-              resolve(r);
-            });
-          });
-          redirectReq.on('error', reject);
-          if (opts.body) redirectReq.write(opts.body);
-          redirectReq.end();
-          return;
-        }
-        res.body = body;
-        resolve(res);
-      });
-    });
-    req.on('error', reject);
-    if (opts.body) req.write(opts.body);
-    req.end();
+// 对 iClass / SSO 域发起请求（按 path 自动选端口/协议）
+function apiRequest(path, opts = {}) {
+  const { port, https } = pickRoute(path);
+  const proto = https ? 'https' : 'http';
+  const url = `${proto}://iclass.buaa.edu.cn:${port}${path}`;
+  const headers = {
+    'User-Agent': UA,
+    'Accept': 'application/json, text/plain, */*',
+    'Referer': 'https://iclass.buaa.edu.cn/',
+    'Accept-Encoding': 'identity',
+    ...(opts.headers || {}),
+  };
+  return rawRequest(url, { ...opts, headers, forceHttps: https });
+}
+
+// SSO 登录：拿 TGC cookie 到 cookieStore
+async function ssoLogin(store, stuId, stuPwd) {
+  // 1) 拿 execution
+  const r1 = await rawRequest(
+    'https://sso.buaa.edu.cn/login?service=' + encodeURIComponent('https://iclass.buaa.edu.cn:8346/'),
+    { method: 'GET', headers: { 'User-Agent': UA }, cookieStore: store }
+  );
+  // 已登录判断：最终 URL 是根路径
+  if (r1.statusCode === 200 && r1.url && new URL(r1.url).pathname === '/') {
+    return true;
+  }
+  const execution = parseTag(r1.body, '"execution" value="', '"');
+  if (!execution) throw new Error('SSO: 找不到 execution 字段');
+
+  // 2) 提交学号 + 密码
+  const form = new URLSearchParams({
+    username: stuId,
+    password: stuPwd,
+    submit: '登录',
+    type: 'username_password',
+    execution,
+    _eventId: 'submit',
+  }).toString();
+  const r2 = await rawRequest('https://sso.buaa.edu.cn/login', {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Referer': 'https://sso.buaa.edu.cn/login',
+    },
+    body: form,
+    cookieStore: store,
   });
+  if (r2.statusCode >= 400) throw new Error(`SSO 登录失败: HTTP ${r2.statusCode}`);
+  // 跳过风险继续登录（如有）
+  if (r2.body && r2.body.includes('continueForm')) {
+    const exec2 = parseTag(r2.body, '"execution" value="', '"');
+    if (!exec2) throw new Error('SSO 风险页: 找不到 execution');
+    const form2 = new URLSearchParams({ execution: exec2, _eventId: 'ignoreAndContinue' }).toString();
+    const r3 = await rawRequest('https://sso.buaa.edu.cn/login', {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': 'https://sso.buaa.edu.cn/login',
+      },
+      body: form2,
+      cookieStore: store,
+    });
+    if (r3.statusCode >= 400) throw new Error(`SSO 风险页失败: HTTP ${r3.statusCode}`);
+  }
+  return true;
+}
+
+// 通过 TGC 调 ?type=jumpMyCenter 拿 loginName
+async function fetchLoginName(store) {
+  // 调试：打印发送的 cookie
+  logReq('  cookie sent to iClass:', store.header('https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter'));
+  const r = await rawRequest(
+    'https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter',
+    {
+      method: 'GET',
+      headers: { 'User-Agent': UA, 'Referer': 'https://iclass.buaa.edu.cn/' },
+      cookieStore: store,
+    }
+  );
+  const url = r.url || '';
+  const ln = parseTag(url, 'loginName=', '&');
+  if (!ln) {
+    logReq('LOGINNAME missing. status=', r.statusCode, 'url=', url);
+    logReq('  body[:500]=', (r.body || '').slice(0, 500));
+    logReq('  store jar keys:', Array.from(store.jar.keys()).map(h => `${h}:[${Array.from(store.jar.get(h) || []).map(([k]) => k).join(',')}]`).join(' '));
+    throw new Error('未能从 iClass 拿到 loginName（SSO 未登录？）');
+  }
+  return ln;
+}
+
+// 用 loginName 调 login_buaa.do 拿 id
+async function fetchClassId(loginName) {
+  const qs = new URLSearchParams({
+    phone: loginName,
+    password: '',
+    verificationType: '2',
+    verificationUrl: '',
+    userLevel: '1',
+  }).toString();
+  const path = `/eschool/app/user/login_buaa.do?${qs}`;
+  const r = await apiRequest(path, { method: 'GET' });
+  logReq('LOGIN_BUAA status=', r.statusCode, 'body[:200]=', (r.body || '').slice(0, 200));
+  const id = parseTag(r.body, '"id":"', '"');
+  if (!id) throw new Error('login_buaa.do 响应中找不到 id');
+  return id;
+}
+
+// 取服务器时间戳（毫秒）
+async function fetchServerTimestamp(sessionId) {
+  const r = await apiRequest('/app/common/get_timestamp.action', {
+    method: 'POST',
+    headers: { 'Sessionid': sessionId },
+  });
+  logReq('TIMESTAMP status=', r.statusCode, 'body[:200]=', (r.body || '').slice(0, 200));
+  if (r.statusCode !== 200) throw new Error(`get_timestamp HTTP ${r.statusCode}`);
+  const ts = parseTag(r.body, '"timestamp":', '}');
+  if (!ts) throw new Error('get_timestamp 响应缺 timestamp 字段');
+  return ts.trim();
+}
+
+// 课表查询
+async function fetchSchedule(sessionId, id, dateStr) {
+  const qs = new URLSearchParams({ dateStr, id }).toString();
+  const path = `/app/course/get_stu_course_sched.action?${qs}`;
+  const r = await apiRequest(path, {
+    method: 'POST',
+    headers: { 'Sessionid': sessionId, 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  logReq('SCHEDULE date=', dateStr, 'status=', r.statusCode);
+  return { status: r.statusCode, body: r.body || '' };
+}
+
+// 签到
+async function doCheckin(sessionId, id, courseSchedId) {
+  // 1) 服务器时间戳
+  const ts = await fetchServerTimestamp(sessionId);
+  // 2) 签到（path 里有 eschool 前缀，端口走 8081）
+  const qs = new URLSearchParams({ courseSchedId, timestamp: ts, id }).toString();
+  const path = `/eschool/app/course/stu_scan_sign.action?${qs}`;
+  const r = await apiRequest(path, {
+    method: 'POST',
+    headers: { 'Sessionid': sessionId, 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  logReq('SIGN status=', r.statusCode, 'body[:200]=', (r.body || '').slice(0, 200));
+  return { status: r.statusCode, body: r.body || '', ts };
 }
 
 // ── 前端 HTML ─────────────────────────────────────────────
@@ -177,6 +377,8 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 <p>5. 使用本工具造成的一切后果由使用者自行承担。</p>
 </details>
 <div class="form-group"><label>学号</label><input id="sid" placeholder="请输入学号" autocomplete="off" spellcheck="false"></div>
+<div class="form-group"><label>统一认证密码（不填可粘贴 loginName）</label><input id="spwd" type="password" placeholder="校园网统一认证密码（可留空）" autocomplete="off"></div>
+<div class="form-group"><label>已登录的 loginName（可选）</label><input id="sloginname" placeholder="从浏览器 SSO 后的 URL 粘贴 loginName= 后面的值" autocomplete="off" spellcheck="false"></div>
 <div class="form-group"><label>姓名（可不填）</label><input id="sname" placeholder="请输入姓名（可不填）" autocomplete="off" spellcheck="false"></div>
 <div class="form-group"><label>查询日期</label><input type="date" id="dateInput"></div>
 <div class="btn-row">
@@ -194,7 +396,13 @@ const $=(s)=>document.querySelector(s);
 const qspin=$('#qspin'),sspin=$('#sspin'),qtxt=$('#qtxt'),stxt=$('#stxt');
 const sidEl=$('#sid'),snameEl=$('#sname'),dateEl=$('#dateInput');
 const msgEl=$('#msg'),listEl=$('#courseList'),apiEl=$('#apiStatus'),signBtn=$('#signBtn'),getBtn=$('#getBtn');
-dateEl.value=new Date().toISOString().split('T')[0];
+function resetDate(){
+  const d=new Date();
+  const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');
+  dateEl.value=y+'-'+m+'-'+day;
+}
+resetDate();
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')resetDate()});
 
 async function check(){
   try{
@@ -209,8 +417,12 @@ function msg(t,m='success'){msgEl.textContent=t;msgEl.className='msg '+m+' show'
 function load(b,spn,txtEl,on){b.disabled=on;spn.style.display=on?'inline-block':'none';txtEl.textContent=on?(b.id==='getBtn'?'查询中...':'签到中...'):''}
 function tm(iso){return iso?iso.substring(11,16):'--:--'}
 
-async function login(phone){
-  const r=await fetch('/api/login?phone='+encodeURIComponent(phone));
+async function login(stuId, stuPwd, loginName){
+  const body={};
+  if(loginName) body.loginName=loginName;
+  else if(stuId && stuPwd){ body.stuId=stuId; body.stuPwd=stuPwd; }
+  else throw new Error('请填写学号与统一认证密码（或粘贴已登录的 loginName）');
+  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await r.json();
   if(d.status!=='0')throw new Error(d.message||'登录失败');
   return d.result;
@@ -221,12 +433,16 @@ async function query(){
   if(!id)return msg('请填写学号','error');
   load(getBtn,qspin,qtxt,true);
   try{
-    const {id:uid2,sessionId:sid2}=await login(id);uid=uid2;sid=sid2;
+    const pwd=document.getElementById('spwd')?.value||'';
+    const ln=document.getElementById('sloginname')?.value||'';
+    const {id:uid2,sessionId:sid2}=await login(id, pwd, ln);uid=uid2;sid=sid2;
+    // 暂存到 localStorage，方便自动签到 daemon 也能用
+    try{ localStorage.setItem('buaa_session', JSON.stringify({uid, sid, stuId:id})); }catch{}
     const r=await fetch('/api/schedule?dateStr='+date+'&userId='+encodeURIComponent(uid)+'&sessionId='+encodeURIComponent(sid));
     const d=await r.json();
     if(d.status!=='0')return msg(d.message||'查询失败','error');
     courses=d.result||[];
-    if(!courses.length){listEl.style.display='none';return msg('该日期没有课程','success')}
+    if(!courses.length){listEl.style.display='none';return msg(d.message||'今日无课程','success')}
     render(courses);msg('查询成功，共 '+courses.length+' 节课','success');
   }catch(e){msg(e.message||'网络请求失败','error')}
   finally{load(getBtn,qspin,qtxt,false)}
@@ -260,7 +476,7 @@ async function sign(){
   if(!sel)return;
   const item=sel;load(signBtn,sspin,stxt,true);
   try{
-    const r=await fetch('/api/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({courseSchedId:item.id,userId:item.uid,classBeginTime:item.classBeginTime,classEndTime:item.classEndTime})});
+    const r=await fetch('/api/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({courseSchedId:item.id,userId:item.uid,classBeginTime:item.classBeginTime,classEndTime:item.classEndTime,sessionId:item.sid})});
     const d=await r.json();
     if(d.status==='0'){
       const s=document.querySelector('.course-item.selected');
@@ -303,52 +519,85 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, { ok: true, ts: Date.now() });
   }
 
-  // API: 登录
-  if (path === '/api/login' && req.method === 'GET') {
-    const phone = url.searchParams.get('phone');
-    if (!phone) return sendJson(res, { status: '1', message: '缺少 phone 参数' }, 400);
+  // API: 登录（POST + JSON {stuId, stuPwd?, loginName?}）
+  //  - 有 stuId+stuPwd：走完整 SSO 登录 → ?type=jumpMyCenter 拿 loginName → login_buaa.do
+  //  - 有 loginName：直接调 login_buaa.do（用户在浏览器已登录 SSO 时可用）
+  if (path === '/api/login' && req.method === 'POST') {
+    let body = '';
+    for await (const c of req) body += c;
+    let parsed;
+    try { parsed = JSON.parse(body); } catch { return sendJson(res, { status: '1', message: '请求体解析失败' }, 400); }
+    const { stuId, stuPwd, loginName } = parsed;
     try {
-      const apiPath = `/app/user/login.action?phone=${encodeURIComponent(phone)}&password=&userLevel=1&verificationType=2&verificationUrl=`;
-      const response = await iClassFetch(apiPath);
-      const data = JSON.parse(response.body);
-      if (data.STATUS === '0' || data.status === '0') {
-        return sendJson(res, { status: '0', result: { id: data.result?.id, sessionId: data.result?.sessionId } });
+      let ln = (loginName || '').trim();
+      if (!ln) {
+        if (!stuId || !stuPwd) {
+          return sendJson(res, { status: '1', message: '需要 stuId+stuPwd 或 loginName' }, 400);
+        }
+        const store = new CookieStore();
+        logReq('SSO_LOGIN start', stuId);
+        await ssoLogin(store, stuId, stuPwd);
+        logReq('SSO_LOGIN done, fetching loginName...');
+        ln = await fetchLoginName(store);
+        logReq('LOGIN_NAME', ln);
       }
-      return sendJson(res, { status: '1', message: data.message || '登录失败' });
+      const id = await fetchClassId(ln);
+      logReq('LOGIN_OK', { id, sessionIdLen: ln.length });
+      return sendJson(res, { status: '0', result: { id, sessionId: ln, userName: stuId || '' } });
     } catch (e) {
-      return sendJson(res, { status: '1', message: '网络请求失败: ' + e.message }, 502);
+      logReq('LOGIN_ERR', e.message);
+      return sendJson(res, { status: '1', message: e.message || '登录失败' }, 502);
     }
   }
 
-  // API: 查课表
+  // API: 查课表（GET ?dateStr=xxx&userId=xxx&sessionId=xxx）
   if (path === '/api/schedule' && req.method === 'GET') {
     const dateStr = url.searchParams.get('dateStr');
     const userId = url.searchParams.get('userId');
     const sessionId = url.searchParams.get('sessionId');
     if (!dateStr || !userId || !sessionId) return sendJson(res, { status: '1', message: '缺少必要参数' }, 400);
     try {
-      const apiPath = `/app/course/get_stu_course_sched.action?dateStr=${encodeURIComponent(dateStr)}&id=${encodeURIComponent(userId)}`;
-      const response = await iClassFetch(apiPath, { headers: { sessionId } });
-      const data = JSON.parse(response.body);
+      const { status, body } = await fetchSchedule(sessionId, userId, dateStr);
+      if (status !== 200) return sendJson(res, { status: '1', message: `HTTP ${status}` }, 502);
+      const data = JSON.parse(body);
+      logReq('SCHEDULE_RESP', dateStr, 'STATUS=' + data.STATUS + (data.ERRMSG ? ', ERR=' + data.ERRMSG : ''));
+      const errMsg = data.ERRMSG || data.message;
+      const errCode = data.ERRCODE;
+      const isBizError = errMsg || (errCode != null && (errCode == 1 || errCode == 2));
+
       if (data.STATUS === '0' || data.status === '0') {
-        return sendJson(res, { status: '0', result: data.result || [] });
+        const courses = Array.isArray(data.result) ? data.result : [];
+        if (courses.length > 0) {
+          return sendJson(res, { status: '0', result: courses });
+        }
+        return sendJson(res, { status: '0', result: [], message: '今日无课程' });
       }
-      return sendJson(res, { status: '1', message: data.message || '查询失败' });
+      if (isBizError || data.STATUS === '2' || data.STATUS == 2) {
+        return sendJson(res, { status: '0', result: [], message: '今日无课程' });
+      }
+      let failMsg = errMsg || '查询失败，请稍后重试';
+      if (errMsg && (errMsg.includes('无权') || errMsg.includes('权限') || errMsg.includes('登录') || errMsg.includes('未登录') || errMsg.includes('会话'))) {
+        failMsg = '会话已过期，请重新查询';
+      } else if (errMsg && (errMsg.includes('超时') || errMsg.includes('timeout'))) {
+        failMsg = '请求超时，请检查网络后重试';
+      } else if (errMsg) {
+        failMsg = errMsg;
+      }
+      return sendJson(res, { status: '1', message: failMsg });
     } catch (e) {
       return sendJson(res, { status: '1', message: '网络请求失败: ' + e.message }, 502);
     }
   }
 
-  // API: 签到
+  // API: 签到（POST + JSON {courseSchedId, userId, classBeginTime, classEndTime, sessionId}）
   if (path === '/api/sign' && req.method === 'POST') {
     let body = '';
     for await (const c of req) body += c;
     let parsed;
     try { parsed = JSON.parse(body); } catch { return sendJson(res, { status: '1', message: '请求体解析失败' }, 400); }
-    const { courseSchedId, userId, classBeginTime, classEndTime } = parsed;
-    if (!courseSchedId || !userId) return sendJson(res, { status: '1', message: '缺少必要参数' }, 400);
+    const { courseSchedId, userId, classBeginTime, classEndTime, sessionId } = parsed;
+    if (!courseSchedId || !userId || !sessionId) return sendJson(res, { status: '1', message: '缺少必要参数' }, 400);
 
-    // 检查签到窗口：课程开始前10分钟 至 课程结束
     if (classBeginTime && classEndTime) {
       const now = Date.now();
       const begin = new Date(classBeginTime).getTime();
@@ -359,17 +608,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const signPath = `/app/course/stu_scan_sign.action?courseSchedId=${encodeURIComponent(courseSchedId)}&timestamp=${Date.now()}`;
-      const response = await iClassFetch(signPath, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `id=${encodeURIComponent(userId)}`,
-      });
-      const data = JSON.parse(response.body);
+      const { status, body: respBody, ts } = await doCheckin(sessionId, userId, courseSchedId);
+      if (status !== 200) return sendJson(res, { status: '1', message: `HTTP ${status}` }, 502);
+      const data = JSON.parse(respBody);
       if (data.STATUS === '0' || data.status === '0') {
-        return sendJson(res, { status: '0', message: '签到成功' });
+        const stuSignStatus = data.result?.stuSignStatus ?? data.result?.stuSignId ?? '';
+        return sendJson(res, { status: '0', message: '签到成功', ts, stuSignStatus });
       }
-      return sendJson(res, { status: '1', message: data.message || '签到失败' });
+      return sendJson(res, { status: '1', message: data.ERRMSG || data.message || '签到失败' });
     } catch (e) {
       return sendJson(res, { status: '1', message: '网络请求失败: ' + e.message }, 502);
     }

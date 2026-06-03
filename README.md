@@ -2,50 +2,95 @@
 
 BUAA 课程签到工具，基于智慧教室扫码签到 API 实现。
 
-## 架构
+## 当前架构
 
 ```
-public/          → 前端静态文件（Cloudflare Pages 托管）
-functions/api/   → Cloudflare Pages Functions（API 代理，解决跨域）
-BUAA-iClassSignIn-main/ → 独立 Python 版（无需网络）
+用户浏览器
+    ↓ (https://iclass.kaguratart.com)
+cloudflared tunnel (systemd 服务，持久运行)
+    ↓
+proxy.js (localhost:8787) → BUAA iClass (内网)
+    ↓
+buaasign_daemon.py (systemd) → 自动轮询 + 签到
 ```
 
-## 部署到 Cloudflare Pages（免费）
+- **`proxy.js`** — Node.js 代理服务器，前端页面 + 转发 API 请求到 BUAA 内网
+- **`buaasign_daemon.py`** — Python 守护进程，每分钟查课表、课前 9 分钟自动签到
+- **`cloudflared.service`** — systemd 服务，通过 Cloudflare Tunnel 将本地服务暴露到公网
+- **域名**：`iclass.kaguratart.com`
 
-### 方式：Dashboard 连接 GitHub（推荐）
+## 服务启动
 
-1. 打开 👉 https://dash.cloudflare.com/?to=/pages
-2. 点击 **"Create a project"**
-3. 选择 **"Import Git repository"**
-4. 选择仓库 `KaguraTart/BuaaSignIn`，分支选 `main`
-5. 构建设置：
-   - **Build command**：留空
-   - **Build output directory**：`public`
-6. 点击 **"Save and Deploy"**
-
-部署完成后，访问 `https://buaa-iclass.<你的子域名>.pages.dev`
-
-> 每次 push 到 `main` 分支都会自动重新部署。
-
-### 重要：API 代理说明
-
-BUAA iClass API (`iclass.buaa.edu.cn`) **没有 CORS 头**，浏览器直接调用会被拦截。
-
-本项目通过 `functions/api/index.js`（Cloudflare Pages Functions）代理请求：
-- `GET /api/status` — 健康检查
-- `GET /api/login?phone=学号` — 登录获取 session
-- `GET /api/schedule?dateStr=&userId=&sessionId=` — 查询课表
-- `POST /api/sign` body `{courseSchedId, userId}` — 签到
-
-前端直接调用 `/api/*` 即可，由 Cloudflare 自动添加 CORS 头。
-
-## 独立 Python 版（无需部署）
-
-不想用网页版？`BUAA-iClassSignIn-main/` 目录下有独立的 Python 工具：
+### 方式一：systemd（推荐）
 
 ```bash
-# 快速签到（只需学号）
+# 启动所有相关服务
+sudo systemctl start buaasign-proxy.service
+sudo systemctl start buaasign.service
+sudo systemctl start buaasign.timer
+sudo systemctl start cloudflared
+
+# 状态
+systemctl status buaasign-proxy buaasign buaasign.timer cloudflared
+```
+
+### 方式二：手动 nohup（systemd 不可用时）
+
+```bash
+cd /home/tartlab/project/others/BUAASign
+nohup node proxy.js > /tmp/proxy.log 2>&1 &
+nohup python3 buaasign_daemon.py --config config.json \
+    >> /home/tartlab/.local/share/buaasign/buaasign.log 2>&1 &
+```
+
+## API 端点 (v5)
+
+| 用途 | 端口/协议 | 路径 |
+|---|---|---|
+| SSO 登录 | 443/HTTPS | `sso.buaa.edu.cn/login` |
+| 拿 loginName | 8346/HTTPS | `?type=jumpMyCenter`（重定向链里含 `loginName=...`） |
+| Class 登录 | 8346/HTTPS | `eschool/app/user/login_buaa.do` |
+| 课表 | 8347/HTTPS | `app/course/get_stu_course_sched.action` |
+| 服务器时间 | 8081/HTTP | `app/common/get_timestamp.action` |
+| 签到 | 8081/HTTP | `eschool/app/course/stu_scan_sign.action` |
+
+所有 Class API 请求必须带 `Sessionid: {loginName}` header。
+
+## 配置
+
+`config.json`（已加入 `.gitignore`）：
+
+```json
+{
+  "stu_id": "你的学号",
+  "stu_pwd": "统一认证密码",
+  "notice_token": "Server酱Token（可选）",
+  "auto_window": 9,
+  "check_interval": 60,
+  "log_file": "/home/tartlab/.local/share/buaasign/buaasign.log",
+  "signed_dates_file": "/home/tartlab/.local/share/buaasign/signed_dates.json"
+}
+```
+
+## 公开访问
+
+- **正式域名**：https://iclass.kaguratart.com
+- **Workers 域名**：https://iclass.kaguratart.workers.dev
+
+## 重要说明
+
+- `iclass.buaa.edu.cn` 解析到内网 IP，proxy.js 直连不经过代理
+- iClass 使用自签名证书，`rejectUnauthorized: false` 已配置
+- 签到窗口：课前 10 分钟至下课
+- **不再需要 offset 二分搜索**：服务器时间戳从 `/app/common/get_timestamp.action` 直接拿
+- **loginName 有效期短**：daemon 每 25 分钟会重新走 SSO 拿
+
+## 独立 Python 版（无需网络，可离线使用）
+
+```bash
 cd BUAA-iClassSignIn-main
+
+# 快速版（只需学号，遍历课表找当前课程）
 # 编辑 main.py，填入 student_id
 python main.py
 

@@ -6,8 +6,13 @@ dist/
 .env
 _routes.json
 
+# 凭据文件
+config.json
+config.local.json
+
 # wrangler files
 .wrangler
 .dev.vars*
 !.dev.vars.example
 !.env.example
+

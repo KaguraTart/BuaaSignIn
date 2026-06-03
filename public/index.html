@@ -409,7 +409,17 @@
         </div>
 
         <div class="form-group">
-            <label for="studentName">姓名</label>
+            <label for="studentPwd">统一认证密码（不填可粘贴 loginName）</label>
+            <input id="studentPwd" type="password" placeholder="校园网统一认证密码" autocomplete="off">
+        </div>
+
+        <div class="form-group">
+            <label for="loginName">已登录的 loginName（可选）</label>
+            <input id="loginName" placeholder="从浏览器 SSO 后的 URL 粘贴 loginName= 后面的值" autocomplete="off" spellcheck="false">
+        </div>
+
+        <div class="form-group">
+            <label for="studentName">姓名（可选，验证用）</label>
             <input id="studentName" placeholder="请输入姓名" autocomplete="off" spellcheck="false">
         </div>
 
@@ -451,6 +461,8 @@
 
         // ─── Elements ──────────────────────────────────────────────────────────
         const studentIdEl = document.getElementById('studentId');
+        const studentPwdEl = document.getElementById('studentPwd');
+        const loginNameEl = document.getElementById('loginName');
         const studentNameEl = document.getElementById('studentName');
         const dateInputEl = document.getElementById('dateInput');
         const getBtn = document.getElementById('getScheduleBtn');
@@ -463,9 +475,20 @@
         const courseListEl = document.getElementById('courseList');
         const apiStatusEl = document.getElementById('apiStatus');
 
-        // Set default date to today
-        const today = new Date();
-        dateInputEl.value = today.toISOString().split('T')[0];
+        // Set default date to today (also resets when page becomes visible after being hidden)
+        function resetDateToToday() {
+            const now = new Date();
+            const y = now.getFullYear(), m = String(now.getMonth() + 1).padStart(2, '0'), d = String(now.getDate()).padStart(2, '0');
+            dateInputEl.value = y + '-' + m + '-' + d;
+        }
+        resetDateToToday();
+
+        // Reset date when page becomes visible (handles midnight crossover while page is open)
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') {
+                resetDateToToday();
+            }
+        });
 
         // ─── API Status Check ──────────────────────────────────────────────────
         async function checkApiStatus() {
@@ -509,26 +532,36 @@
         }
 
         // ─── Login + Session ───────────────────────────────────────────────────
-        async function login(phone) {
-            const res = await fetch(`${API_BASE}/api/login?phone=${encodeURIComponent(phone)}`);
+        async function login(stuId, stuPwd, loginName) {
+            const body = {};
+            if (loginName) body.loginName = loginName;
+            else if (stuId && stuPwd) { body.stuId = stuId; body.stuPwd = stuPwd; }
+            else throw new Error('请填写学号+统一认证密码，或粘贴已登录的 loginName');
+            const res = await fetch(`${API_BASE}/api/login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
             const data = await res.json();
             if (data.status !== '0') throw new Error(data.message || '登录失败');
-            return { userId: data.result.id, sessionId: data.result.sessionId };
+            return { userId: data.result.id, sessionId: data.result.sessionId, userName: data.result.userName };
         }
 
         // ─── Query Schedule ────────────────────────────────────────────────────
         async function querySchedule() {
             const id = studentIdEl.value.trim();
-            const name = studentNameEl.value.trim();
+            const pwd = studentPwdEl.value.trim();
+            const ln = loginNameEl.value.trim();
             const date = dateInputEl.value.replace(/-/g, '');
 
-            if (!id || !name) return showMessage('请填写学号与姓名', 'error');
+            if (!id) return showMessage('请填写学号', 'error');
+            if (!pwd && !ln) return showMessage('请填写统一认证密码（或粘贴已登录的 loginName）', 'error');
 
             setLoading(getBtn, querySpinner, queryBtnText, true, '查询课程');
 
             try {
                 // Login first to get session
-                const { userId: uid, sessionId: sid } = await login(id);
+                const { userId: uid, sessionId: sid } = await login(id, pwd, ln);
                 userId = uid;
                 sessionId = sid;
 
