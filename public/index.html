@@ -409,7 +409,7 @@
         </div>
 
         <div class="form-group">
-            <label for="studentPwd">统一认证密码（不填可粘贴 loginName）</label>
+            <label for="studentPwd">统一认证密码（首次或会话过期时填）</label>
             <input id="studentPwd" type="password" placeholder="校园网统一认证密码" autocomplete="off">
         </div>
 
@@ -443,6 +443,9 @@
         <div id="message" class="message"></div>
 
         <div class="divider"></div>
+        <div style="text-align:center;font-size:12px;color:var(--text-muted);margin-top:-8px;">
+            <a href="#" id="logoutBtn" style="color:var(--error);text-decoration:none;">退出登录（清除本机记忆）</a>
+        </div>
         <div class="footer">
             <div>基于 BUAA iClass API 构建 · 参考自 <a href="https://github.com/theFool-wn" target="_blank">GitHub</a></div>
             <div>仅供学习交流，请合理使用</div>
@@ -532,6 +535,17 @@
         }
 
         // ─── Login + Session ───────────────────────────────────────────────────
+        const SESS_KEY = 'buaa_session_v1';
+        function loadSess() {
+            try { return JSON.parse(localStorage.getItem(SESS_KEY) || 'null'); } catch { return null; }
+        }
+        function saveSess(s) {
+            try { localStorage.setItem(SESS_KEY, JSON.stringify(s)); } catch {}
+        }
+        function clearSess() {
+            try { localStorage.removeItem(SESS_KEY); } catch {}
+        }
+
         async function login(stuId, stuPwd, loginName) {
             const body = {};
             if (loginName) body.loginName = loginName;
@@ -547,6 +561,34 @@
             return { userId: data.result.id, sessionId: data.result.sessionId, userName: data.result.userName };
         }
 
+        async function tryAutoRestore() {
+            const s = loadSess();
+            if (!s || !s.sessionId || !s.userId || !s.stuId) return false;
+            studentIdEl.value = s.stuId;
+            if (studentNameEl) studentNameEl.value = s.userName || '';
+            userId = s.userId;
+            sessionId = s.sessionId;
+            studentIdEl.dataset.lastStuId = s.stuId;
+            const date = dateInputEl.value.replace(/-/g, '');
+            try {
+                const res = await fetch(
+                    `${API_BASE}/api/schedule?dateStr=${date}&userId=${encodeURIComponent(userId)}&sessionId=${encodeURIComponent(sessionId)}`
+                );
+                const data = await res.json();
+                if (data.status === '0') {
+                    courses = data.result || [];
+                    renderCourseList(courses);
+                    showMessage(`已自动登录 ${s.userName || s.stuId}，共 ${courses.length} 节课`, 'success');
+                    return true;
+                }
+                clearSess();
+                userId = ''; sessionId = '';
+                return false;
+            } catch {
+                return false;
+            }
+        }
+
         // ─── Query Schedule ────────────────────────────────────────────────────
         async function querySchedule() {
             const id = studentIdEl.value.trim();
@@ -555,15 +597,24 @@
             const date = dateInputEl.value.replace(/-/g, '');
 
             if (!id) return showMessage('请填写学号', 'error');
-            if (!pwd && !ln) return showMessage('请填写统一认证密码（或粘贴已登录的 loginName）', 'error');
 
             setLoading(getBtn, querySpinner, queryBtnText, true, '查询课程');
 
             try {
-                // Login first to get session
-                const { userId: uid, sessionId: sid } = await login(id, pwd, ln);
-                userId = uid;
-                sessionId = sid;
+                // 已有有效 session 且学号未改：直接用，避免每次都重登
+                const hasSess = sessionId && userId && studentIdEl.dataset.lastStuId === id;
+                if (!hasSess) {
+                    if (!pwd && !ln) {
+                        setLoading(getBtn, querySpinner, queryBtnText, false, '查询课程');
+                        return showMessage('请填写统一认证密码（或粘贴已登录的 loginName）', 'error');
+                    }
+                    const r = await login(id, pwd, ln);
+                    userId = r.userId;
+                    sessionId = r.sessionId;
+                    if (studentNameEl) studentNameEl.value = r.userName || '';
+                    studentIdEl.dataset.lastStuId = id;
+                    saveSess({ stuId: id, userId, sessionId, userName: r.userName || '', savedAt: Date.now() });
+                }
 
                 const res = await fetch(
                     `${API_BASE}/api/schedule?dateStr=${date}&userId=${encodeURIComponent(userId)}&sessionId=${encodeURIComponent(sessionId)}`
@@ -571,6 +622,12 @@
                 const data = await res.json();
 
                 if (data.status !== '0') {
+                    if (/会话|登录|未登录|401|4001/.test(data.message || '')) {
+                        clearSess();
+                        userId = ''; sessionId = '';
+                        studentIdEl.dataset.lastStuId = '';
+                        return showMessage('会话已过期，请重新填写密码登录', 'error');
+                    }
                     return showMessage(data.message || '查询失败', 'error');
                 }
 
@@ -679,6 +736,11 @@
                     signBtn.classList.remove('active');
                     showMessage('签到成功', 'success');
                 } else {
+                    if (/会话|登录|401|4001/.test(data.message || '')) {
+                        clearSess();
+                        userId = ''; sessionId = '';
+                        studentIdEl.dataset.lastStuId = '';
+                    }
                     showMessage(data.message || '签到失败', 'error');
                 }
             } catch (e) {
@@ -692,27 +754,38 @@
         getBtn.addEventListener('click', querySchedule);
         signBtn.addEventListener('click', doSignIn);
 
-        studentIdEl.addEventListener('input', () => {
+        function onUserInput() {
             courses = [];
             selectedCourse = null;
             courseListEl.style.display = 'none';
             signBtn.disabled = true;
             signBtn.classList.remove('active');
-        });
-        studentNameEl.addEventListener('input', () => {
-            courses = [];
-            selectedCourse = null;
-            courseListEl.style.display = 'none';
-            signBtn.disabled = true;
-            signBtn.classList.remove('active');
-        });
+        }
+        studentIdEl.addEventListener('input', onUserInput);
+        studentNameEl.addEventListener('input', onUserInput);
+
+        function logout() {
+            clearSess();
+            userId = ''; sessionId = '';
+            studentIdEl.dataset.lastStuId = '';
+            studentIdEl.value = '';
+            studentPwdEl.value = '';
+            loginNameEl.value = '';
+            if (studentNameEl) studentNameEl.value = '';
+            onUserInput();
+            showMessage('已退出登录', 'success');
+        }
+        document.getElementById('logoutBtn').addEventListener('click', e => { e.preventDefault(); logout(); });
 
         // Enter key to query
-        [studentIdEl, studentNameEl].forEach(el => {
+        [studentIdEl, studentNameEl, studentPwdEl, loginNameEl].forEach(el => {
             el.addEventListener('keydown', e => {
                 if (e.key === 'Enter') querySchedule();
             });
         });
+
+        // 启动时尝试自动登录
+        tryAutoRestore();
     </script>
 </body>
 </html>

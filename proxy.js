@@ -388,14 +388,19 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 <div id="courseList" class="course-list" style="display:none"></div>
 <div id="msg" class="msg"></div>
 <div class="divider"></div>
+<div style="text-align:center;font-size:12px;color:var(--muted)">
+  <a href="#" id="logoutBtn" style="color:var(--e);text-decoration:none">退出登录（清除本机记忆）</a>
+</div>
 <div class="footer"><div>基于 BUAA iClass API 构建 · 参考自 <a href="https://github.com/theFool-wn" target="_blank">GitHub</a></div><div>仅供学习交流，请合理使用</div></div>
 </div>
 <script>
-let uid='',sid='',courses=[],sel=null;
+let uid='',sid='',courses=[],sel=null,userName='';
 const $=(s)=>document.querySelector(s);
 const qspin=$('#qspin'),sspin=$('#sspin'),qtxt=$('#qtxt'),stxt=$('#stxt');
 const sidEl=$('#sid'),snameEl=$('#sname'),dateEl=$('#dateInput');
+const pwdEl=$('#spwd'),lnEl=$('#sloginname');
 const msgEl=$('#msg'),listEl=$('#courseList'),apiEl=$('#apiStatus'),signBtn=$('#signBtn'),getBtn=$('#getBtn');
+const SESS_KEY='buaa_session_v1';
 function resetDate(){
   const d=new Date();
   const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');
@@ -417,6 +422,12 @@ function msg(t,m='success'){msgEl.textContent=t;msgEl.className='msg '+m+' show'
 function load(b,spn,txtEl,on){b.disabled=on;spn.style.display=on?'inline-block':'none';txtEl.textContent=on?(b.id==='getBtn'?'查询中...':'签到中...'):''}
 function tm(iso){return iso?iso.substring(11,16):'--:--'}
 
+function loadSess(){
+  try{const s=JSON.parse(localStorage.getItem(SESS_KEY)||'null');return s;}catch{return null;}
+}
+function saveSess(s){try{localStorage.setItem(SESS_KEY,JSON.stringify(s));}catch{}}
+function clearSess(){try{localStorage.removeItem(SESS_KEY);}catch{}}
+
 async function login(stuId, stuPwd, loginName){
   const body={};
   if(loginName) body.loginName=loginName;
@@ -428,19 +439,54 @@ async function login(stuId, stuPwd, loginName){
   return d.result;
 }
 
+async function tryAutoRestore(){
+  const s=loadSess();
+  if(!s||!s.sid||!s.uid||!s.stuId) return false;
+  sidEl.value=s.stuId;uid=s.uid;sid=s.sid;userName=s.userName||'';
+  if(snameEl) snameEl.value=userName;
+  // 静默试一次查课表
+  const date=dateEl.value.replace(/-/g,'');
+  try{
+    const r=await fetch('/api/schedule?dateStr='+date+'&userId='+encodeURIComponent(uid)+'&sessionId='+encodeURIComponent(sid));
+    const d=await r.json();
+    if(d.status==='0'){
+      courses=d.result||[];
+      render(courses);
+      msg(\`已自动登录 \${userName||s.stuId}，共 \${courses.length} 节课\`,'success');
+      return true;
+    }
+    // session 失效，清掉
+    clearSess();sid='';uid='';userName='';
+    return false;
+  }catch{return false;}
+}
+
 async function query(){
   const id=sidEl.value.trim(),date=dateEl.value.replace(/-/g,'');
   if(!id)return msg('请填写学号','error');
   load(getBtn,qspin,qtxt,true);
   try{
-    const pwd=document.getElementById('spwd')?.value||'';
-    const ln=document.getElementById('sloginname')?.value||'';
-    const {id:uid2,sessionId:sid2}=await login(id, pwd, ln);uid=uid2;sid=sid2;
-    // 暂存到 localStorage，方便自动签到 daemon 也能用
-    try{ localStorage.setItem('buaa_session', JSON.stringify({uid, sid, stuId:id})); }catch{}
+    const pwd=pwdEl?pwdEl.value:'';
+    const ln=lnEl?lnEl.value:'';
+    // 已有 session 就不用重登
+    let needLogin=!(sid && uid && id===sidEl.dataset.lastStuId);
+    if(needLogin){
+      const r=await login(id, pwd, ln);
+      uid=r.id;sid=r.sessionId;userName=r.userName||'';
+      sidEl.dataset.lastStuId=id;
+      saveSess({stuId:id,uid,sid,userName,savedAt:Date.now()});
+      if(snameEl) snameEl.value=userName;
+    }
     const r=await fetch('/api/schedule?dateStr='+date+'&userId='+encodeURIComponent(uid)+'&sessionId='+encodeURIComponent(sid));
     const d=await r.json();
-    if(d.status!=='0')return msg(d.message||'查询失败','error');
+    if(d.status!=='0'){
+      // session 失效 → 清掉并提示重新登录
+      if(/会话|登录|未登录|401|4001/.test(d.message||'')){
+        clearSess();sid='';uid='';
+        return msg('会话已过期，请重新填写密码登录','error');
+      }
+      return msg(d.message||'查询失败','error');
+    }
     courses=d.result||[];
     if(!courses.length){listEl.style.display='none';return msg(d.message||'今日无课程','success')}
     render(courses);msg('查询成功，共 '+courses.length+' 节课','success');
@@ -483,15 +529,34 @@ async function sign(){
       if(s){s.classList.add('signed');const b=s.querySelector('.badge-u');if(b){b.className='badge badge-s';b.textContent='已签到'}s.querySelector('.radio').style.cssText='border-color:var(--s);background:var(--s)';s.classList.remove('selected')}
       sel=null;signBtn.disabled=true;signBtn.classList.remove('active');
       msg('签到成功','success');
-    }else{msg(d.message||'签到失败','error')}
+    }else{
+      if(/会话|登录|401|4001/.test(d.message||'')){
+        clearSess();sid='';uid='';
+      }
+      msg(d.message||'签到失败','error');
+    }
   }catch{msg('网络错误','error')}
   finally{load(signBtn,sspin,stxt,false)}
+}
+
+function logout(){
+  clearSess();sid='';uid='';userName='';courses=[];sel=null;
+  listEl.style.display='none';signBtn.disabled=true;signBtn.classList.remove('active');
+  sidEl.value='';
+  if(pwdEl) pwdEl.value='';
+  if(lnEl) lnEl.value='';
+  if(snameEl) snameEl.value='';
+  msg('已退出登录','success');
 }
 
 getBtn.addEventListener('click',query);
 signBtn.addEventListener('click',sign);
 sidEl.addEventListener('input',()=>{courses=[];sel=null;listEl.style.display='none';signBtn.disabled=true;signBtn.classList.remove('active')});
-[sidEl,snameEl].forEach(el=>el.addEventListener('keydown',e=>{if(e.key==='Enter')query()}));
+[sidEl,snameEl,pwdEl,lnEl].filter(Boolean).forEach(el=>el.addEventListener('keydown',e=>{if(e.key==='Enter')query()}));
+document.getElementById('logoutBtn')?.addEventListener('click',e=>{e.preventDefault();logout()});
+
+// 启动时尝试自动登录
+tryAutoRestore();
 </script>
 </body>
 </html>`;
